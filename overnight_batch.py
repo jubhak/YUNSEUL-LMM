@@ -380,6 +380,21 @@ def run_text_job(job, cfg, log, dry_run: bool = False) -> None:
         validate_text_output(job, text, out)
     log("INFO", f"{job['id']}: {out} 저장 ({len(text)}자, DoD 통과)")
 
+    # 전자책 작업인 경우 books/YYYY-MM-DD/ 폴더 자동 아카이빙 (HTML/MD 동시 생성)
+    if "ebook" in job.get("id", "") or "원고" in job.get("prompt", ""):
+        try:
+            from ebook_writer import save_ebook_auto_increment
+            topic = "전자책 단행본"
+            for line in text.splitlines():
+                clean_l = line.strip()
+                if clean_l.startswith("# ") and not clean_l.startswith("## "):
+                    topic = clean_l[2:].strip()
+                    break
+            html_p, md_p, f_idx = save_ebook_auto_increment(topic, text)
+            log("INFO", f"{job['id']}: books 자동 아카이빙 성공 -> {html_p} (당일 순번: {f_idx:02d})")
+        except Exception as eb_err:
+            log("WARN", f"{job['id']}: books 자동 아카이빙 실패 (경고): {eb_err}")
+
 
 def run_audio_job(job, cfg, log, dry_run: bool = False) -> None:
     workdir = Path(cfg["workdir"])

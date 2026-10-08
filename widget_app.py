@@ -1208,13 +1208,24 @@ class YunseulLMMStudio(QWidget):
         bot_bar.addWidget(self.lbl_word_count)
         bot_bar.addStretch()
 
-        btn_save = QPushButton("💾 원고 저장")
+        btn_save = QPushButton("💾 원고 임시저장")
         btn_save.setStyleSheet("background-color: #1e293b; color: white; border: 1px solid #475569; border-radius: 6px; padding: 6px 14px;")
         btn_save.clicked.connect(self.save_ebook_content)
         bot_bar.addWidget(btn_save)
 
-        btn_export = QPushButton("📄 HTML/PDF 내보내기")
-        btn_export.setStyleSheet("background-color: #059669; color: white; font-weight: bold; border-radius: 6px; padding: 6px 14px;")
+        btn_publish = QPushButton("🚀 전자책 출판하기 (books 자동 저장)")
+        btn_publish.setStyleSheet("""
+            QPushButton {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #059669, stop:1 #10b981);
+                color: white; font-weight: bold; font-size: 13px; border: none; border-radius: 6px; padding: 7px 16px;
+            }
+            QPushButton:hover { background: #34d399; }
+        """)
+        btn_publish.clicked.connect(self.publish_ebook)
+        bot_bar.addWidget(btn_publish)
+
+        btn_export = QPushButton("📄 HTML 열기")
+        btn_export.setStyleSheet("background-color: #1e293b; color: #cbd5e1; border: 1px solid #475569; border-radius: 6px; padding: 6px 14px;")
         btn_export.clicked.connect(self.export_ebook_html)
         bot_bar.addWidget(btn_export)
 
@@ -1280,6 +1291,25 @@ class YunseulLMMStudio(QWidget):
         if existing_rewrite.exists():
             self.txt_merge_res.setPlainText(existing_rewrite.read_text(encoding="utf-8"))
         right_layout.addWidget(self.txt_merge_res)
+
+        m_bot_bar = QHBoxLayout()
+        btn_send_to_ebook = QPushButton("📝 전자책 스튜디오로 보내기")
+        btn_send_to_ebook.setStyleSheet("background-color: #1e293b; color: white; border: 1px solid #475569; border-radius: 6px; padding: 6px 14px;")
+        btn_send_to_ebook.clicked.connect(self.send_merge_to_ebook)
+        m_bot_bar.addWidget(btn_send_to_ebook)
+
+        btn_publish_merge = QPushButton("🚀 융합 글을 전자책으로 출판 (books 자동 저장)")
+        btn_publish_merge.setStyleSheet("""
+            QPushButton {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #059669, stop:1 #10b981);
+                color: white; font-weight: bold; border: none; border-radius: 6px; padding: 7px 16px;
+            }
+            QPushButton:hover { background: #34d399; }
+        """)
+        btn_publish_merge.clicked.connect(self.publish_merge_as_ebook)
+        m_bot_bar.addWidget(btn_publish_merge)
+        right_layout.addLayout(m_bot_bar)
+
         splitter.addWidget(right_pane)
 
         layout.addWidget(splitter)
@@ -1935,7 +1965,7 @@ class YunseulLMMStudio(QWidget):
             topic = self.edit_topic.text().strip() or "전자책"
 
             # books/YYYY-MM-DD/ 자동 아카이빙 및 ebook-01.html, ebook-02.html 순번 채번
-            html_path, md_path, file_idx = save_ebook_auto_increment(topic, text)
+            html_path, md_path, file_idx = save_ebook_auto_increment(topic, text, books_dir=BOOKS_DIR)
 
             # 기존 batch_out 동기화
             out_file = BATCH_OUT / "ebook-01.md"
@@ -1953,13 +1983,13 @@ class YunseulLMMStudio(QWidget):
                 f"• 저장 파일: {html_path.name} (당일 {file_idx}번째 책)\n"
                 f"• 전체 경로: {html_path}\n"
                 f"• 총 소요 시간: {elapsed_str}\n\n"
-                f"아래 [📄 HTML/PDF 내보내기] 또는 [📁 books 폴더 열기] 버튼으로 완성된 책을 확인하실 수 있습니다."
+                f"아래 [📄 HTML 열기] 또는 [📁 books 폴더 열기] 버튼으로 완성된 책을 확인하실 수 있습니다."
             )
         else:
             if text:
                 self.txt_ebook.setPlainText(text)
                 topic = self.edit_topic.text().strip() or "전자책"
-                save_ebook_auto_increment(topic, text)
+                save_ebook_auto_increment(topic, text, books_dir=BOOKS_DIR)
                 out_file = BATCH_OUT / "ebook-01.md"
                 out_file.write_text(text, encoding="utf-8")
             self.lbl_ebook_status.setText("⚠️ 집필이 중단되었습니다.")
@@ -1971,16 +2001,60 @@ class YunseulLMMStudio(QWidget):
             QMessageBox.warning(self, "원고 없음", "저장할 원고 내용이 없습니다.")
             return
         topic = self.edit_topic.text().strip() or "전자책"
-        html_path, md_path, file_idx = save_ebook_auto_increment(topic, text)
+        html_path, md_path, file_idx = save_ebook_auto_increment(topic, text, books_dir=BOOKS_DIR)
         out_file = BATCH_OUT / "ebook-01.md"
         out_file.write_text(text, encoding="utf-8")
         QMessageBox.information(
             self,
-            "저장 완료",
+            "임시 저장 완료",
             f"원고가 books 폴더에 안전하게 저장되었습니다.\n\n"
+            f"• 저장 위치: books/{html_path.parent.name}/{html_path.name}\n"
             f"• HTML: {html_path}\n"
             f"• MD 원고: {md_path}"
         )
+
+    def publish_ebook(self):
+        """원고를 정식 전자책(HTML/MD)으로 출판하여 books/YYYY-MM-DD/ 폴더에 자동 순번 저장하고 브라우저로 실행"""
+        text = self.txt_ebook.toPlainText()
+        if not text.strip():
+            QMessageBox.warning(self, "원고 없음", "출판할 전자책 원고 내용이 없습니다. 먼저 원고를 작성하거나 불러와주세요.")
+            return
+
+        topic = self.edit_topic.text().strip()
+        if not topic:
+            for line in text.splitlines():
+                clean_l = line.strip()
+                if clean_l.startswith("# ") and not clean_l.startswith("## "):
+                    topic = clean_l[2:].strip()
+                    break
+        if not topic:
+            topic = "전자책 단행본"
+
+        html_path, md_path, file_idx = save_ebook_auto_increment(topic, text, books_dir=BOOKS_DIR)
+
+        # batch_out 동기화
+        out_file = BATCH_OUT / "ebook-01.md"
+        out_file.write_text(text, encoding="utf-8")
+        (BATCH_OUT / "ebook-01.html").write_text(html_path.read_text(encoding="utf-8"), encoding="utf-8")
+
+        self.lbl_ebook_status.setText(f"🎉 정식 출판 완료! (books 저장: {html_path.parent.name}/{html_path.name})")
+        self.lbl_ebook_time_info.setText(f"✅ 정식 출판: books/{html_path.parent.name}/{html_path.name}")
+
+        a4_pages = max(1, len(text) // 1000)
+        QMessageBox.information(
+            self,
+            "전자책 정식 출판 완료",
+            f"축하합니다! 전자책이 성공적으로 출판되어 books 폴더에 저장되었습니다.\n\n"
+            f"• 저장 폴더: books/{html_path.parent.name}/\n"
+            f"• 저장 파일: {html_path.name} (당일 {file_idx}번째 책)\n"
+            f"• 전체 경로: {html_path}\n"
+            f"• 원고 분량: {len(text):,}자 (A4 약 {a4_pages}페이지 분량)\n\n"
+            f"확인을 누르면 완성된 전자책 HTML이 브라우저에서 자동으로 열립니다."
+        )
+        try:
+            os.startfile(str(html_path))
+        except Exception:
+            pass
 
     def export_ebook_html(self):
         text = self.txt_ebook.toPlainText()
@@ -1989,8 +2063,11 @@ class YunseulLMMStudio(QWidget):
             return
 
         topic = self.edit_topic.text().strip() or "전자책"
-        html_path, md_path, file_idx = save_ebook_auto_increment(topic, text)
-        os.startfile(str(html_path))
+        html_path, md_path, file_idx = save_ebook_auto_increment(topic, text, books_dir=BOOKS_DIR)
+        try:
+            os.startfile(str(html_path))
+        except Exception:
+            pass
 
     # -------------------------------------------------------------------------
     # Actions: Merge / RAG
@@ -2025,9 +2102,51 @@ class YunseulLMMStudio(QWidget):
         if ok:
             self.txt_merge_res.setPlainText(text)
             (BATCH_OUT / "rewrite-01.md").write_text(text, encoding="utf-8")
-            QMessageBox.information(self, "재구성 완료", "글 융합 재구성이 완료되었습니다.")
+            QMessageBox.information(self, "재구성 완료", "글 융합 재구성이 완료되었습니다. 아래 [🚀 전자책으로 출판] 버튼으로 즉시 단행본 저장이 가능합니다.")
         else:
             QMessageBox.critical(self, "오류", err)
+
+    def send_merge_to_ebook(self):
+        text = self.txt_merge_res.toPlainText()
+        if not text.strip():
+            QMessageBox.warning(self, "내용 없음", "전자책 스튜디오로 보낼 융합 글 내용이 없습니다.")
+            return
+        self.txt_ebook.setPlainText(text)
+        for line in text.splitlines():
+            clean_l = line.strip()
+            if clean_l.startswith("# ") and not clean_l.startswith("## "):
+                self.edit_topic.setText(clean_l[2:].strip())
+                break
+        self.tabs.setCurrentWidget(self.tab_ebook)
+        QMessageBox.information(self, "이동 완료", "융합 글이 전자책 스튜디오로 전달되었습니다. 검토 후 [🚀 전자책 출판하기]를 눌러주세요.")
+
+    def publish_merge_as_ebook(self):
+        text = self.txt_merge_res.toPlainText()
+        if not text.strip():
+            QMessageBox.warning(self, "내용 없음", "출판할 융합 글 내용이 없습니다.")
+            return
+
+        topic = "2026 자율 AI 에이전트와 순차 배치가 여는 미래"
+        for line in text.splitlines():
+            clean_l = line.strip()
+            if clean_l.startswith("# ") and not clean_l.startswith("## "):
+                topic = clean_l[2:].strip()
+                break
+
+        html_path, md_path, file_idx = save_ebook_auto_increment(topic, text, books_dir=BOOKS_DIR)
+        QMessageBox.information(
+            self,
+            "전자책 출판 완료",
+            f"융합 원고가 books 폴더에 전자책으로 정식 출판되었습니다.\n\n"
+            f"• 저장 폴더: books/{html_path.parent.name}/\n"
+            f"• 파일명: {html_path.name} (당일 {file_idx}번째 책)\n"
+            f"• 전체 경로: {html_path}\n\n"
+            f"확인을 누르면 완성된 전자책 HTML이 브라우저에서 자동으로 열립니다."
+        )
+        try:
+            os.startfile(str(html_path))
+        except Exception:
+            pass
 
     # -------------------------------------------------------------------------
     # Actions: Music & Audio Player

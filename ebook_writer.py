@@ -22,10 +22,22 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
+def get_base_dir():
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    base = Path(__file__).resolve().parent
+    if (base / "books").exists() or (base / "widget_app.py").exists():
+        return base
+    dev_path = Path(r"D:\workspace\YUNSEUL-LMM")
+    if dev_path.exists():
+        return dev_path
+    return base
+
 # 기본 디렉터리 설정
-BASE_DIR = Path(__file__).resolve().parent
+BASE_DIR = get_base_dir()
 BOOKS_DIR = BASE_DIR / "books"
 BATCH_OUT = BASE_DIR / "batch_out"
+BOOKS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def markdown_to_book_html(title: str, markdown_content: str, date_str: str = None) -> str:
