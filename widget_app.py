@@ -31,6 +31,7 @@ from PyQt6.QtCore import Qt, QTimer, QPoint, pyqtSignal, QThread
 from PyQt6.QtGui import QFont, QColor, QIcon, QPixmap, QCursor, QAction, QIntValidator
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtCore import QUrl
+from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
 
@@ -1728,9 +1729,24 @@ class YunseulLMMStudio(QWidget):
         )
 
     def show_normal(self):
+        self.show_and_activate()
+
+    def show_and_activate(self):
+        """기존 창을 화면에 복원/표시하고 최상단 포그라운드로 팝업합니다."""
         self.show()
         self.setWindowState(self.windowState() & ~Qt.WindowState.WindowMinimized | Qt.WindowState.WindowActive)
+        self.raise_()
         self.activateWindow()
+
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                hwnd = int(self.winId())
+                # SW_RESTORE = 9
+                ctypes.windll.user32.ShowWindow(hwnd, 9)
+                ctypes.windll.user32.SetForegroundWindow(hwnd)
+            except Exception:
+                pass
 
     # -------------------------------------------------------------------------
     # Server & VRAM Management
@@ -2365,9 +2381,39 @@ class YunseulLMMStudio(QWidget):
         QApplication.quit()
 
 
+SINGLE_INSTANCE_KEY = "YUNSEUL_LMM_SINGLE_INSTANCE_IPC"
+
+
 def main():
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
+
+    # 1. 이미 1개의 인스턴스가 실행 중인지 확인 (단일 인스턴스 보장)
+    socket = QLocalSocket()
+    socket.connectToServer(SINGLE_INSTANCE_KEY)
+    if socket.waitForConnected(500):
+        # 이미 1개 인스턴스가 실행 중인 경우: 기존 인스턴스에 복원 요청 전송
+        socket.write(b"RESTORE\n")
+        socket.waitForBytesWritten(1000)
+        socket.disconnectFromServer()
+
+        # Windows에서 기존 인스턴스가 창을 최상단으로 띄울 수 있도록 권한 부여
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                # ASFW_ANY = -1: 다른 프로세스가 SetForegroundWindow 호출할 수 있도록 허용
+                ctypes.windll.user32.AllowSetForegroundWindow(-1)
+            except Exception:
+                pass
+
+        # 추가 실행 프로세스는 즉시 정상 종료 (중복 실행 방지)
+        return 0
+
+    # 2. 첫 번째 인스턴스인 경우: QLocalServer 수신 대기 시작
+    local_server = QLocalServer()
+    # 이전 비정상 종료 등으로 남아있을 수 있는 소켓/파이프 정리
+    QLocalServer.removeServer(SINGLE_INSTANCE_KEY)
+    local_server.listen(SINGLE_INSTANCE_KEY)
 
     if ICON_ICO.exists():
         app.setWindowIcon(QIcon(str(ICON_ICO)))
@@ -2376,8 +2422,22 @@ def main():
 
     studio = YunseulLMMStudio()
     studio.show()
-    sys.exit(app.exec())
+
+    # 이미 실행 중인 상태에서 사용자가 앱을 또 실행했을 때 기존 창을 복원/팝업하는 핸들러
+    def handle_new_instance():
+        client_socket = local_server.nextPendingConnection()
+        if client_socket:
+            client_socket.waitForReadyRead(500)
+            client_socket.disconnectFromServer()
+            studio.show_and_activate()
+
+    local_server.newConnection.connect(handle_new_instance)
+
+    exit_code = app.exec()
+    local_server.close()
+    QLocalServer.removeServer(SINGLE_INSTANCE_KEY)
+    return exit_code
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
