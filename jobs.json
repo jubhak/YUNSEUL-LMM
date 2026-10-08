@@ -1,0 +1,57 @@
+{
+  "batch_name": "overnight-batch",
+  "workdir": "./batch_out",
+  "text_model": "qwen3:14b",
+  "unload": {
+    "vram_free_threshold_mb": 2000,
+    "poll_timeout_sec": 120,
+    "poll_interval_sec": 5
+  },
+  "retry": {
+    "max_attempts": 3,
+    "backoff_sec": 10
+  },
+  "commands": {
+    "text": "builtin-ollama-api",
+    "music": "acestep --prompt-file {prompt_file} --output {out} --duration {duration}",
+    "tts": "python -m gpt_sovits.inference --text-file {prompt_file} --output {out}"
+  },
+  "jobs": [
+    {
+      "id": "ebook-01",
+      "phase": "text",
+      "kind": "text",
+      "out": "ebook-01.md",
+      "prompt": "다음 주제로 전자책 1장 분량(3000자 이상)의 원고를 작성하라.\n\n주제: '인공지능의 현대 사회에 미치는 영향과 인간-AI 공존의 미래'\n\n[필수 지침]\n1. 목차와 챕터 구조(제1장, 1. 경제 구조 변화, 2. 의료 혁신, 3. 윤리적 도전, 4. 미래 전망, 결론)를 체계적으로 포함할 것.\n2. 사실 검증된 구체적 사례와 정밀한 통계를 포함할 것 (예: 테슬라 기가프레스 다이캐스팅 및 비전 AI 공정 효율 30% 개선, WEF 미래일자리보고서 8500만 개 대체 및 9700만 개 신규 창출 순증, 메드트로닉 Mazor X 척추경 나사못 삽입 정확도 95%~98% 달성, 초기 IBM Watson의 교훈과 현대 의료 AI의 정착).\n3. 분량은 반드시 3,000자 이상으로 깊이 있게 서술할 것."
+    },
+    {
+      "id": "rewrite-01",
+      "phase": "text",
+      "kind": "text",
+      "out": "rewrite-01.md",
+      "prompt": "아래에 첨부된 세 편의 블로그 글을 읽고, 핵심 인사이트를 종합하여 '2026년 자율 AI 에이전트와 순차 배치가 여는 업무 자동화의 미래'라는 제목의 하나의 깊이 있는 새로운 분석 글로 재구성하라.\n\n[참고 블로그 원문 1: blog_sources/blog1_ai_agents.md]\n인공지능의 활용 방식이 단순 질의응답(Chatbot)에서 자율 루프(Autonomous Loop) 중심의 실행 에이전트로 급격히 진화하고 있다. 단일 프롬프트에 의존하던 1세대 LLM 활용법은 환각과 맥락 손실이라는 한계를 겪었으며, 이를 극복하기 위해 루프 엔지니어링이 등장했다. 에이전트는 사람 개입 없이 스스로 계획-실행-검증-재시도를 수행한다.\n\n[참고 블로그 원문 2: blog_sources/blog2_enterprise_automation.md]\n16GB 내외의 단일 GPU VRAM 환경에서 거대 LLM과 오디오/음악 모델을 동시에 구동할 경우 OOM이 발생하므로 순차 배치(Sequential Batch) 아키텍처가 필수적이다. 텍스트 단계를 완전히 마치고 VRAM에서 가중치를 언로드한 뒤 실측 검증 게이트를 거쳐 오디오 단계로 진입해야 한다.\n\n[참고 블로그 원문 3: blog_sources/blog3_human_ai_collaboration.md]\n밤 동안 AI가 자율 실행되고 아침에 인간이 리포트를 검토하는 협업이 성립하려면 모호함 대신 안전하게 멈추는 Fail-Fast와 물리적 출력 검증(DoD) 및 투명한 추적성이 필수적이다.\n\n[작성 요구사항]\n1. 세 원문의 문장을 단순 복사하지 말고, 논리적 흐름에 따라 새로운 통찰을 담아 1,500자 이상으로 재구성할 것.\n2. 글의 말미에 참고한 원문 3편에 대한 출처 표기를 명시할 것."
+    },
+    {
+      "id": "lyrics-01",
+      "phase": "text",
+      "kind": "text",
+      "out": "lyrics-01.txt",
+      "prompt": "주제: 밤하늘의 별을 보며 지나간 청춘의 방황과 새로운 희망을 노래하는 서정적인 한국어 어쿠스틱 발라드 가사\n\n[형식 요구사항]\n반드시 아래 라벨을 사용하여 기승전결 구조를 완성할 것:\n[Verse 1] (1절: 늦은 밤 창가에서 느껴지는 고요함과 지난날의 회상)\n[Chorus] (후렴: 어둠 속에서도 빛나는 별처럼 다시 일어서겠다는 다짐)\n[Verse 2] (2절: 넘어졌던 시간들이 나를 자라게 했다는 깨달음)\n[Chorus] (후렴: 감정의 고조와 희망의 메시지)\n[Bridge] (브릿지: 마음 깊은 곳의 고백과 위로)\n[Outro] (아웃트로: 여운을 남기는 마무리 잔향)"
+    },
+    {
+      "id": "song-01",
+      "phase": "audio",
+      "kind": "music",
+      "out": "song-01.mp3",
+      "duration": 60,
+      "prompt": "emotional Korean female vocals, clear expressive singing voice, slow emotional acoustic ballad, acoustic guitar arpeggio, soft piano, 65 bpm"
+    },
+    {
+      "id": "tts-01",
+      "phase": "audio",
+      "kind": "tts",
+      "out": "tts-01.wav",
+      "prompt": "ebook-01.md 본문을 차분하고 신뢰감 있는 목소리로 읽어라."
+    }
+  ]
+}

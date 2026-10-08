@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+
+# AI engines and model checkpoints
+audio_engines/ACE-Step-1.5/
+audio_engines/GPT-SoVITS/
+trained_vocal_models/
+temp_acestep/
+.cache/
+
+# Build artifacts & executables
+build/
+dist/
+*.exe
+*.zip
+
+# Generated batch outputs & logs
+batch_out/
+*.log
+
+# IDE & OS
+.idea/
+.vscode/
+*.swp
+*.swo
+Thumbs.db
