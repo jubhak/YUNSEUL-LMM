@@ -647,7 +647,12 @@ class MusicGenWorker(QThread):
             time.sleep(1.0)
 
             # 2. VRAM 잔여량 실측
-            vram_used, _ = get_gpu_memory()
+            vram_used, total_vram = get_gpu_memory()
+            if total_vram > 0 and (total_vram - vram_used) < 6500:
+                raise RuntimeError(
+                    f"가용 VRAM 부족으로 작곡을 시작할 수 없습니다 (가용: {total_vram - vram_used:,} MiB / 최소 필요: 6,500 MiB).\n"
+                    f"다른 프로그램을 종료하여 VRAM을 확보해주세요."
+                )
             self.progress.emit(f"[VRAM 중재자] VRAM 점유량: {vram_used} MiB (안전 임계치 통과)")
 
             # 3. 임시 프롬프트 및 가사 파일 저장
@@ -1861,12 +1866,110 @@ class YunseulLMMStudio(QWidget):
             if self.is_server_alive():
                 QMessageBox.information(self, "포트 변경", "서버가 실행 중입니다. 새 포트를 적용하려면 서버를 껐다 켜주세요.")
 
+    def check_vram_for_task(self, task_type: str) -> tuple:
+        """
+        작업 시작 전 가용 VRAM 점검
+        - task_type in ('ebook', 'merge'): Ollama 텍스트 모델(qwen3:14b) 구동에 가용 VRAM 점검
+        - task_type in ('music', 'train'): ACE-Step 1.5 공식 오디오 엔진에 최소 7,000 MiB 필요
+        부족할 경우 (False, 상세 경고 메시지) 반환
+        """
+        used_mb, total_mb = get_gpu_memory()
+        if total_mb <= 0:
+            return True, ""
+
+        free_mb = total_mb - used_mb
+
+        if task_type in ("ebook", "merge"):
+            # 1. Ollama에 이미 모델이 로드되어 있는지 확인
+            is_already_loaded = False
+            try:
+                url = f"http://127.0.0.1:{self.port}/api/ps"
+                req = urllib.request.Request(url, headers={"User-Agent": "YUNSEUL-LMM"})
+                with urllib.request.urlopen(req, timeout=1.0) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    models = data.get("models", [])
+                    target_model = self.cfg.get("text_model", "qwen3:14b")
+                    for m in models:
+                        m_name = m.get("name", "")
+                        if target_model in m_name or m_name.startswith(target_model.split(":")[0]):
+                            is_already_loaded = True
+                            break
+            except Exception:
+                pass
+
+            if is_already_loaded:
+                req_mb = 1000
+                if free_mb < req_mb:
+                    msg = (
+                        f"현재 가용 VRAM이 부족하여 전자책 집필을 시작할 수 없습니다.\n\n"
+                        f"• 모델({self.cfg.get('text_model', 'qwen3:14b')})이 로드되어 있으나 추론 여유 공간이 부족합니다.\n"
+                        f"• 현재 가용 VRAM: {free_mb:,} MiB (최소 필요: {req_mb:,} MiB)\n"
+                        f"• 현재 사용량: {used_mb:,} MiB / 전체 {total_mb:,} MiB\n\n"
+                        f"다른 프로그램을 종료하거나 [VRAM 즉시 비우기]를 실행한 후 다시 시도해주세요."
+                    )
+                    return False, msg
+                return True, ""
+
+            # 모델이 아직 로드되지 않은 경우 약 8,000 MiB 필요
+            req_mb = 8000
+            if free_mb < req_mb:
+                deficit = req_mb - free_mb
+                msg = (
+                    f"현재 가용 VRAM이 부족하여 전자책 집필을 시작할 수 없습니다.\n\n"
+                    f"• 필요 VRAM: 약 {req_mb:,} MiB ({self.cfg.get('text_model', 'qwen3:14b')} 가중치 로드)\n"
+                    f"• 현재 가용 VRAM: {free_mb:,} MiB\n"
+                    f"• 현재 사용량: {used_mb:,} MiB / 전체 {total_mb:,} MiB\n"
+                    f"• 부족한 VRAM: 약 {deficit:,} MiB\n\n"
+                    f"VRAM을 점유하고 있는 다른 프로그램(영상 편집, 타 AI 모델, 게임 등)을 종료하거나 [VRAM 즉시 비우기]를 실행한 후 다시 시도해주세요."
+                )
+                return False, msg
+
+        elif task_type in ("music", "train"):
+            # 1. 텍스트 모델이 VRAM에 남아있다면 언로드 시도
+            try:
+                subprocess.run(
+                    ["ollama", "stop", self.cfg.get("text_model", "qwen3:14b")],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=CREATE_NO_WINDOW
+                )
+                time.sleep(0.5)
+            except Exception:
+                pass
+
+            used_mb, total_mb = get_gpu_memory()
+            free_mb = total_mb - used_mb
+            req_mb = 7000
+
+            task_name = "보컬 음악 작곡" if task_type == "music" else "보컬 모델 학습"
+            engine_name = "ACE-Step 1.5 일체형 오디오 엔진" if task_type == "music" else "보컬 음색 학습 엔진"
+
+            if free_mb < req_mb:
+                deficit = req_mb - free_mb
+                msg = (
+                    f"현재 가용 VRAM이 부족하여 {task_name}을(를) 시작할 수 없습니다.\n\n"
+                    f"• 필요 VRAM: 최소 {req_mb:,} MiB ({engine_name})\n"
+                    f"• 현재 가용 VRAM: {free_mb:,} MiB\n"
+                    f"• 현재 사용량: {used_mb:,} MiB / 전체 {total_mb:,} MiB\n"
+                    f"• 부족한 VRAM: 약 {deficit:,} MiB\n\n"
+                    f"VRAM을 점유하고 있는 다른 프로그램(영상 처리, 게임, 타 AI 프로세스 등)을 종료한 후 다시 시도해주세요."
+                )
+                return False, msg
+
+        return True, ""
+
     # -------------------------------------------------------------------------
     # Actions: eBook Generation
     # -------------------------------------------------------------------------
     def start_ebook_generation(self):
         if not self.is_server_alive():
             QMessageBox.warning(self, "서버 미실행", "Ollama 서버가 정지되어 있습니다. 먼저 [서버 시작] 버튼을 눌러주세요.")
+            return
+
+        # VRAM 잔여량 점검 (부족 시 경고 팝업 및 시작 차단)
+        ok, vram_msg = self.check_vram_for_task("ebook")
+        if not ok:
+            QMessageBox.warning(self, "VRAM 부족 - 집필 불가", vram_msg)
             return
 
         topic = self.edit_topic.text().strip()
@@ -2082,6 +2185,11 @@ class YunseulLMMStudio(QWidget):
             QMessageBox.warning(self, "서버 미실행", "Ollama 서버를 먼저 켜주세요.")
             return
 
+        ok, vram_msg = self.check_vram_for_task("merge")
+        if not ok:
+            QMessageBox.warning(self, "VRAM 부족 - 재구성 불가", vram_msg)
+            return
+
         instruction = self.edit_merge_prompt.text().strip()
         # 원문 내용 모으기
         sources_text = ""
@@ -2216,6 +2324,12 @@ class YunseulLMMStudio(QWidget):
             QMessageBox.warning(self, "가사 필요", "노래할 가사를 입력해주세요.")
             return
 
+        # VRAM 잔여량 점검 (부족 시 경고 팝업 및 시작 차단)
+        ok, vram_msg = self.check_vram_for_task("music")
+        if not ok:
+            QMessageBox.warning(self, "VRAM 부족 - 작곡 불가", vram_msg)
+            return
+
         ref_audio = self.combo_vocal_model.currentData() if hasattr(self, "combo_vocal_model") else None
         genre_title = self.combo_music_genre.currentText().split("(")[0].strip() if hasattr(self, "combo_music_genre") else "보컬 음악"
 
@@ -2345,6 +2459,12 @@ class YunseulLMMStudio(QWidget):
         model_name = self.edit_model_name.text().strip()
         if not model_name:
             QMessageBox.warning(self, "이름 필요", "보컬 모델 이름을 입력해 주세요.")
+            return
+
+        # VRAM 잔여량 점검 (부족 시 경고 팝업 및 시작 차단)
+        ok, vram_msg = self.check_vram_for_task("train")
+        if not ok:
+            QMessageBox.warning(self, "VRAM 부족 - 학습 불가", vram_msg)
             return
 
         preset = self.combo_train_preset.currentData() or "standard"
