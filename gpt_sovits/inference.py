@@ -50,34 +50,70 @@ def read_source_text(text_file: Path) -> str:
 
 
 def synthesize_speech(text: str, sample_rate: int = 24000) -> np.ndarray:
-    # 1. 고품질 한국어 Neural TTS (edge-tts)
+    """원문 전체(마크다운 정제 후)를 낭독한다. 기존의 400자 컷은 제거.
+    edge-tts 는 긴 텍스트를 청크(약 900자)로 나눠 생성한 뒤 이어 붙인다."""
+    def clean_for_tts(raw: str) -> str:
+        t = re.sub(r'```.*?```', ' 코드 생략 ', raw, flags=re.S)
+        t = re.sub(r'[#*`\[\]()>|_]', ' ', t)
+        t = re.sub(r'https?://\S+', ' 링크 ', t)
+        t = re.sub(r'\s+', ' ', t)
+        return t.strip()
+
+    narration_text = clean_for_tts(text)
+    if not narration_text:
+        narration_text = "낭독할 본문이 없습니다."
+
+    # 1. 고품질 한국어 Neural TTS (edge-tts) - 전문 낭독
     try:
         import asyncio
         import edge_tts
         import io
         import tempfile
 
-        # 전자책 서두 핵심 본문 400자 추출 (마크다운 헤더 및 특수문자 정리)
-        narration_text = re.sub(r'[#*`\[\]\(\)>_-]', ' ', text[:500])
-        narration_text = ' '.join(narration_text.split())
+        CHUNK = 900  # 문장 경계 기준 청크
+        chunks = []
+        start = 0
+        while start < len(narration_text):
+            end = min(start + CHUNK, len(narration_text))
+            if end < len(narration_text):
+                m = None
+                for punct in ('.', '!', '?', '다.', '요.', '니다.'):
+                    p = narration_text.rfind(punct, start, end)
+                    if p > start:
+                        m = max(m or 0, p + len(punct))
+                if m:
+                    end = m
+            chunks.append(narration_text[start:end].strip())
+            start = end
 
-        temp_mp3 = tempfile.mktemp(suffix=".mp3")
-        async def _speak():
-            comm = edge_tts.Communicate(narration_text, "ko-KR-InJoonNeural")
-            await comm.save(temp_mp3)
+        async def _speak_all():
+            parts = []
+            for i, ch in enumerate(chunks):
+                if not ch:
+                    continue
+                temp_mp3 = tempfile.mktemp(suffix=".mp3")
+                comm = edge_tts.Communicate(ch, "ko-KR-InJoonNeural", rate="-4%")
+                await comm.save(temp_mp3)
+                if Path(temp_mp3).exists() and Path(temp_mp3).stat().st_size > 500:
+                    y, sr = sf.read(temp_mp3)
+                    if y.ndim > 1:
+                        y = y.mean(axis=1)
+                    parts.append(y.astype(np.float32))
+                    # 문장/청크 사이 자연스러운 호흡 간격
+                    parts.append(np.zeros(int(sr * 0.35), dtype=np.float32))
+                try:
+                    os.remove(temp_mp3)
+                except Exception:
+                    pass
+                print(f"[gpt_sovits] 낭독 청크 {i+1}/{len(chunks)} 완료")
+            return parts
 
-        asyncio.run(_speak())
-        if Path(temp_mp3).exists() and Path(temp_mp3).stat().st_size > 1000:
-            import soundfile as sf
-            y, sr = sf.read(temp_mp3)
-            try:
-                os.remove(temp_mp3)
-            except Exception:
-                pass
-            if y.ndim > 1:
-                y = y.mean(axis=1)
-            print(f"[gpt_sovits] Synthesized via Korean Neural TTS (edge-tts): {len(y)} samples ({len(y)/sr:.1f}s)")
-            return y.astype(np.float32)
+        parts = asyncio.run(_speak_all())
+        if parts:
+            full = np.concatenate(parts)
+            print(f"[gpt_sovits] Synthesized via Korean Neural TTS (edge-tts): "
+                  f"{len(full)} samples ({len(full)/sr:.1f}s, {len(narration_text)}자 전문)")
+            return full
     except Exception as e:
         print(f"[gpt_sovits] Edge-TTS error, trying fallback (info: {e})")
 

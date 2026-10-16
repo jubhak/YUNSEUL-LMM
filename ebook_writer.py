@@ -430,10 +430,17 @@ def generate_and_save_ebook(
             full_text += f"{i+1}. {ch.get('title')}\n"
         full_text += "\n---\n\n"
 
+        # 실행 요약(running summary) — 챕터 간 일관성 유지용 메모리
+        story_memory = ""
+
         for idx, ch in enumerate(chapters):
             ch_title = ch.get("title", f"제{idx+1}장")
             ch_summary = ch.get("summary", "")
             log_func(f"✍️ [{idx+1}/{total_steps}] '{ch_title}' 집필 중...")
+
+            memory_block = ""
+            if story_memory:
+                memory_block = f"\n[지금까지 집필된 내용 요약 - 앞 내용과 모순되지 않게 이어서 쓸 것]\n{story_memory}\n"
 
             prompt = f"""당신은 '{topic}' 분야의 최고 권위자이자 전문 저술가입니다.
 전체 전자책 기획에 맞춰, 아래 챕터의 원고를 최소 3,000자 이상으로 깊이 있고 풍부하게 작성하십시오.
@@ -441,7 +448,7 @@ def generate_and_save_ebook(
 [현재 집필할 챕터]
 제목: {ch_title}
 핵심 요강: {ch_summary}
-
+{memory_block}
 [전체 주제]
 {topic}
 
@@ -449,11 +456,24 @@ def generate_and_save_ebook(
 1. 실제 통계, 역사적/현대적 사례, 구체적인 예시와 비유를 풍부하게 포함할 것.
 2. 단순 나열을 피하고 기승전결이 있는 서술형 문장으로 깊이 있게 전개할 것.
 3. 세부 소제목(### 1. ..., ### 2. ..., ### 3. ...)을 명확히 나누어 독자가 몰입할 수 있도록 할 것.
-4. 책의 한 장이므로 챕터 제목(## {ch_title})으로 시작할 것."""
+4. 책의 한 장이므로 챕터 제목(## {ch_title})으로 시작할 것.
+5. 앞 챕터에서 이미 설명한 내용을 반복하지 말고, 필요하면 '앞 장에서 언급했듯이'로 연결할 것."""
 
             ch_content = call_ollama(prompt, model=model, port=port, max_tokens=8192)
             full_text += f"\n\n## {ch_title}\n\n{ch_content}\n\n---\n"
             log_func(f"   ✓ '{ch_title}' 완료 ({len(ch_content):,}자)")
+
+            # 다음 챕터를 위한 실행 요약 갱신
+            try:
+                sum_prompt = (
+                    "아래 챕터 원고의 핵심 논지, 인물/사례, 결론을 3문장 이내로 요약하십시오. "
+                    "요약만 출력하십시오.\n\n" + ch_content
+                )
+                ch_digest = call_ollama(sum_prompt, model=model, port=port, max_tokens=512)
+                if ch_digest:
+                    story_memory = (story_memory + f"\n- [{ch_title}] {ch_digest.strip()}").strip()
+            except Exception:
+                pass
 
     elapsed = int(time.time() - start_time)
     em, es = divmod(elapsed, 60)

@@ -120,23 +120,18 @@ def generate_ballad_music(prompt: str, duration_sec: int, sample_rate: int = 441
 
 
 def main():
-    parser = argparse.ArgumentParser(description="acestep music generation engine (ACE-Step 1.5)")
-    parser.add_argument("--prompt-file", required=True, help="Path to prompt text file")
-    parser.add_argument("--output", required=True, help="Output audio file path")
-    parser.add_argument("--duration", type=int, default=120, help="Duration in seconds")
-    args = parser.parse_args()
+    """
+    가짜 사인파 합성을 전면 폐기하고, 공식 ACE-Step 1.5 러너(acestep_official_runner.py)를 직접 실행하도록 연결
+    """
+    runner_path = Path(__file__).resolve().parent / "audio_engines" / "acestep_official_runner.py"
+    if runner_path.exists():
+        import subprocess
+        cmd = [sys.executable, str(runner_path)] + sys.argv[1:]
+        res = subprocess.run(cmd)
+        return res.returncode
+    print("[acestep] 오류: acestep_official_runner.py를 찾을 수 없습니다.")
+    return 1
 
-    prompt_path = Path(args.prompt_file)
-    prompt = prompt_path.read_text(encoding="utf-8").strip("\ufeff").strip() if prompt_path.exists() else ""
-    out_path = Path(args.output)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    print(f"[acestep] Generating music for {args.duration}s: '{prompt[:60]}...'")
-    audio = generate_ballad_music(prompt, args.duration)
-
-    sf.write(str(out_path), audio, 44100, format="MP3")
-    print(f"[acestep] Saved {out_path} ({out_path.stat().st_size} bytes)")
-    return 0
 
 if __name__ == "__main__":
     sys.exit(main())

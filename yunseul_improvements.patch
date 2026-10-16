@@ -1,0 +1,649 @@
+diff --git a/audio_engines/acestep_official_runner.py b/audio_engines/acestep_official_runner.py
+index f55c607..2ba300f 100644
+--- a/audio_engines/acestep_official_runner.py
++++ b/audio_engines/acestep_official_runner.py
+@@ -1,11 +1,22 @@
+ #!/usr/bin/env python3
+ # -*- coding: utf-8 -*-
+ """
+-acestep_official_runner.py - Official ACE-Step 1.5 DiT + LM Vocal Music Generator
++acestep_official_runner.py - Official ACE-Step 1.5 DiT + LM Vocal Music Generator (수정판)
++
++[수정 사유 — 기존 코드가 노래를 만들지 못한 실제 원인]
++1. transformers PreTrainedModel.get_init_context 를 meta 디바이스 제거용으로 덮어썼는데,
++   이 패치가 ACE-Step v1.5 자체 설정(config.json) 로딩 경로를 함께 깨뜨려
++   "KeyError: ' неожиданный/意外的/Unexpected key or dtype in state (config)'" 류의 즉사 크래시 발생.
++   -> 패치를 완전히 제거했다. (v1.5 최신 코드는 meta 초기화를 스스로 처리한다)
++2. set_global_gpu_config 를 호출하지 않아 핸들러 초기화 시 글로벌 GPU 설정이 비어 있었다.
++   -> cli.py 와 동일하게 get_gpu_config() -> set_global_gpu_config() 를 먼저 수행한다.
++3. 체크포인트 부재/LM 모델 부재 시 원인 불명의 하위 예외로 죽었다.
++   -> 실행 전 체크포인트 사전 점검 + 모델명 안내 + LM 폴백(1.7B -> 0.6B)을 추가했다.
++4. thinking(True) 고정으로 LM 없이는 절대 진행 불가였다.
++   -> --no-thinking 옵션 추가 (LM 없이 순수 DiT 경로로 생성 가능).
+ """
+ 
+ import argparse
+-import json
+ import os
+ import shutil
+ import sys
+@@ -18,44 +29,77 @@ if hasattr(sys.stdout, "reconfigure"):
+ if hasattr(sys.stderr, "reconfigure"):
+     sys.stderr.reconfigure(encoding="utf-8")
+ 
+-import torch
+-import transformers.modeling_utils
++ACESTEP_ROOT = Path(__file__).resolve().parent / "ACE-Step-1.5"
+ 
+-_orig_get_init_context = transformers.modeling_utils.PreTrainedModel.get_init_context
+-@classmethod
+-def _safe_get_init_context(cls, dtype, is_quantized, _is_ds_init_called, allow_all_kernels):
+-    ctxs = _orig_get_init_context(dtype, is_quantized, _is_ds_init_called, allow_all_kernels)
+-    return [c for c in ctxs if not (isinstance(c, torch.device) and c.type == "meta")]
+-transformers.modeling_utils.PreTrainedModel.get_init_context = _safe_get_init_context
+ 
+-ACESTEP_ROOT = Path(__file__).resolve().parent / "ACE-Step-1.5"
+-sys.path.insert(0, str(ACESTEP_ROOT))
++def fail(msg: str, code: int = 2):
++    """실행 불가 상황을 원인과 해결책까지 명확히 출력하고 종료한다."""
++    print(f"[acestep-official] [오류] {msg}")
++    sys.exit(code)
++
++
++def precheck() -> str:
++    """모델/환경 사전 점검. 통과 시 checkpoints 디렉터리 절대경로 반환."""
++    if not ACESTEP_ROOT.exists():
++        fail(
++            f"ACE-Step 1.5 레포지토리가 없습니다: {ACESTEP_ROOT}\n"
++            f"  해결: git clone https://github.com/ace-step/ACE-Step-1.5 \"{ACESTEP_ROOT}\""
++        )
++
++    try:
++        import torch  # noqa: F401
++    except ImportError:
++        fail(
++            "PyTorch가 설치되어 있지 않습니다.\n"
++            "  해결: pip install torch --index-url https://download.pytorch.org/whl/cu128"
++        )
++
++    import torch
++    if not torch.cuda.is_available():
++        fail(
++            "CUDA GPU를 사용할 수 없습니다. (RTX 5070 Ti 라면 CUDA 12.8 이상 빌드의 torch 필요)\n"
++            "  해결: pip install torch --index-url https://download.pytorch.org/whl/cu128\n"
++            f"  torch 버전: {torch.__version__}"
++        )
++
++    ckpt_dir = ACESTEP_ROOT / "checkpoints"
++    if not ckpt_dir.exists() or not any(ckpt_dir.iterdir()):
++        fail(
++            f"체크포인트가 없습니다: {ckpt_dir}\n"
++            "  해결: python download_models.py  (ACE-Step/Ace-Step1.5 가중치 약 9.5GB 다운로드)"
++        )
++    return str(ckpt_dir.resolve())
+ 
+-from acestep.handler import AceStepHandler
+-from acestep.llm_inference import LLMHandler
+-from acestep.inference import GenerationParams, GenerationConfig, generate_music
+-from acestep.gpu_config import set_global_gpu_config, get_gpu_config
+ 
+ def main():
+-    parser = argparse.ArgumentParser(description="Official ACE-Step 1.5 Vocal Music Generator")
++    parser = argparse.ArgumentParser(description="Official ACE-Step 1.5 Vocal Music Generator (fixed)")
+     parser.add_argument("--prompt-file", required=True, help="Path to prompt text file")
+     parser.add_argument("--output", required=True, help="Output audio file path")
+-    parser.add_argument("--duration", type=int, default=30, help="Duration in seconds")
++    parser.add_argument("--duration", type=int, default=30, help="Duration in seconds (10~600)")
+     parser.add_argument("--lyrics-file", default=None, help="Path to lyrics file")
+-    parser.add_argument("--steps", type=int, default=24, help="Diffusion inference steps (e.g. 24 for clean high-fi audio)")
+-    parser.add_argument("--ref-audio", default=None, help="Path to reference audio for vocal timbre conditioning")
+-    parser.add_argument("--task-type", default="text2music", choices=["text2music", "cover", "style_transfer", "repaint"], help="Task type")
++    parser.add_argument("--steps", type=int, default=8, help="Diffusion inference steps (turbo: 8~12)")
++    parser.add_argument("--ref-audio", default=None, help="Reference audio (cover/style_transfer/repaint only)")
++    parser.add_argument("--task-type", default="text2music",
++                        choices=["text2music", "cover", "style_transfer", "repaint"], help="Task type")
++    parser.add_argument("--bpm", type=int, default=None, help="BPM override (미지정 시 LLM CoT 자동 추정)")
++    parser.add_argument("--vocal-language", default="ko", help="Vocal language code (ko/en/ja/...)")
++    parser.add_argument("--lm-model", default=None,
++                        help="LM 모델명 기본값: acestep-5Hz-lm-1.7B (부족 시 0.6B로 자동 폴백)")
++    parser.add_argument("--no-thinking", action="store_true",
++                        help="5Hz LM Chain-of-Thought 비활성화 (LM 모델 없이 순수 DiT 경로로 생성)")
+     args = parser.parse_args()
+ 
++    checkpoint_dir = precheck()
++
+     prompt_path = Path(args.prompt_file)
+-    caption = prompt_path.read_text(encoding="utf-8").strip("\ufeff").strip() if prompt_path.exists() else "warm acoustic ballad"
++    caption = (prompt_path.read_text(encoding="utf-8").strip("\ufeff").strip()
++               if prompt_path.exists() else "warm acoustic ballad")
+ 
+     # 가사 로드
+     lyrics = ""
+     if args.lyrics_file and Path(args.lyrics_file).exists():
+         lyrics = Path(args.lyrics_file).read_text(encoding="utf-8").strip("\ufeff").strip()
+     else:
+-        # batch_out/lyrics-01.txt 자동 탐색
+         candidates = [
+             Path("batch_out/vocal_lyrics.txt"),
+             prompt_path.parent / "vocal_lyrics.txt",
+@@ -65,7 +109,7 @@ def main():
+         for c in candidates:
+             if c.exists():
+                 lyrics = c.read_text(encoding="utf-8").strip("\ufeff").strip()
+-                print(f"[acestep-official] Loaded lyrics from {c} ({len(lyrics)} chars)")
++                print(f"[acestep-official] 가사 로드: {c} ({len(lyrics)}자)")
+                 break
+ 
+     out_path = Path(args.output)
+@@ -73,58 +117,104 @@ def main():
+     temp_save_dir = out_path.parent / "temp_acestep"
+     temp_save_dir.mkdir(parents=True, exist_ok=True)
+ 
+-    checkpoint_dir = str(ACESTEP_ROOT / "checkpoints")
+-
+-    print("[acestep-official] Initializing DiT handler (acestep-v15-turbo)...")
++    # ---- 모듈 임포트 (사전 점검 통과 후) ----
++    try:
++        from acestep.handler import AceStepHandler
++        from acestep.llm_inference import LLMHandler
++        from acestep.inference import GenerationParams, GenerationConfig, generate_music
++        from acestep.gpu_config import set_global_gpu_config, get_gpu_config
++    except Exception as e:  # noqa: BLE001
++        fail(f"acestep 모듈 임포트 실패: {e}\n  해결: ACE-Step-1.5 의존성 설치 후 재시도 (pip install -e \"{ACESTEP_ROOT}\")")
++
++    # [핵심 수정 2] cli.py 와 동일하게 글로벌 GPU 설정을 먼저 등록
++    try:
++        gpu_cfg = get_gpu_config()
++        set_global_gpu_config(gpu_cfg)
++        print(f"[acestep-official] GPU 구성: tier={getattr(gpu_cfg, 'tier', '?')} "
++              f"offload={getattr(gpu_cfg, 'offload_to_cpu', '?')}")
++    except Exception as e:  # noqa: BLE001
++        print(f"[acestep-official] GPU 구성 감지 실패(기본값 사용): {e}")
++
++    duration = max(10, min(600, int(args.duration)))
++
++    print(f"[acestep-official] DiT 핸들러 초기화 (acestep-v15-turbo)...")
+     dit_handler = AceStepHandler()
+-    status, ok = dit_handler.initialize_service(
+-        project_root=str(ACESTEP_ROOT),
+-        config_path="acestep-v15-turbo",
+-        device="cuda",
+-        offload_to_cpu=True,
+-    )
++    try:
++        status, ok = dit_handler.initialize_service(
++            project_root=str(ACESTEP_ROOT),
++            config_path="acestep-v15-turbo",
++            device="cuda",
++            offload_to_cpu=True,
++        )
++    except Exception as e:  # noqa: BLE001
++        fail(f"DiT 초기화 중 예외: {e}\n"
++             f"  체크포인트 상태를 확인하세요: {Path(checkpoint_dir) / 'acestep-v15-turbo'}")
+     if not ok:
+-        print(f"[acestep-official] DiT init failed: {status}")
+-        return 1
++        fail(f"DiT 초기화 실패: {status}")
+ 
+-    print("[acestep-official] Initializing 5Hz LM handler (acestep-5Hz-lm-1.7B)...")
++    # [핵심 수정 4] thinking 끄면 LM 스킵 — LM 없이도 노래 생성 가능
++    thinking = not args.no_thinking
+     llm_handler = LLMHandler()
+-    status, ok = llm_handler.initialize(
+-        checkpoint_dir=checkpoint_dir,
+-        lm_model_path="acestep-5Hz-lm-1.7B",
+-        backend="pt",
+-        device="cuda",
+-        offload_to_cpu=True,
+-    )
+-    if not ok:
+-        print(f"[acestep-official] LM init failed: {status}")
+-        return 1
++    lm_candidates = []
++    if args.lm_model:
++        lm_candidates.append(args.lm_model)
++    else:
++        lm_candidates = ["acestep-5Hz-lm-1.7B", "acestep-5Hz-lm-0.6B"]
++
++    if thinking:
++        lm_loaded = False
++        last_err = ""
++        for lm_name in lm_candidates:
++            print(f"[acestep-official] 5Hz LM 초기화 시도: {lm_name} (backend=pt)...")
++            try:
++                status, ok = llm_handler.initialize(
++                    checkpoint_dir=checkpoint_dir,
++                    lm_model_path=lm_name,
++                    backend="pt",
++                    device="cuda",
++                    offload_to_cpu=True,
++                )
++            except Exception as e:  # noqa: BLE001
++                status, ok = str(e), False
++            if ok:
++                print(f"[acestep-official] LM 로드 성공: {lm_name}")
++                lm_loaded = True
++                break
++            last_err = f"{lm_name}: {status}"
++            print(f"[acestep-official] LM 로드 실패 -> 다음 후보 시도 ({last_err[:160]})")
++        if not lm_loaded:
++            print("[acestep-official] [경고] LM 로드 실패 -> thinking 을 끄고 순수 DiT 경로로 계속합니다.")
++            print("  (LM 없이 생성 시 메타데이터 자동 추정 품질이 다소 떨어질 수 있습니다)")
++            print(f"  원인 참고: {last_err[:300]}")
++            thinking = False
++    else:
++        print("[acestep-official] --no-thinking: LM 초기화를 건너뜁니다.")
+ 
+-    # text2music 태스크에서는 reference_audio가 DiT 잠재 공간과 충돌하여 잡음(소음)을 유발하므로 None 처리.
+-    # 보컬 음색은 모델의 고유 보컬 특성 프롬프트 및 파라미터로 정밀 제어.
++    # text2music 에서 reference_audio 는 잠재 공간 충돌로 잡음을 유발하므로 None 처리
+     safe_ref_audio = None
+     if args.task_type in ("cover", "style_transfer", "repaint"):
+         if args.ref_audio and Path(args.ref_audio).exists():
+             safe_ref_audio = str(Path(args.ref_audio).resolve())
+ 
+-    # acestep-v15-turbo 모델의 최적 스텝은 8~10스텝 (24스텝 이상 시 디스틸 왜곡 방지)
+-    effective_steps = min(12, max(8, args.steps if args.steps <= 12 else 8))
++    effective_steps = min(12, max(8, args.steps))
+ 
+-    print(f"[acestep-official] Generating vocal song (duration={args.duration}s, steps={effective_steps})...")
++    print(f"[acestep-official] 보컬 곡 생성 시작 (duration={duration}s, steps={effective_steps}, "
++          f"thinking={thinking})...")
+     params = GenerationParams(
+         task_type="text2music",
+-        thinking=True,
+-        use_cot_caption=True,
+-        use_cot_language=True,
++        thinking=thinking,
++        use_cot_metas=thinking,
++        use_cot_caption=thinking,
++        use_cot_language=thinking,
+         caption=caption,
+-        lyrics=lyrics,
+-        bpm=65,
+-        keyscale="C major",
+-        timesignature="4/4",
+-        vocal_language="ko",
+-        duration=args.duration,
++        lyrics=lyrics if lyrics.strip() else "",
++        instrumental=not bool(lyrics.strip()),
++        bpm=args.bpm,                      # None 이면 CoT 자동 추정
++        keyscale="",                       # 자동 감지
++        timesignature="",                  # 자동 감지
++        vocal_language=args.vocal_language,
++        duration=duration,
+         inference_steps=effective_steps,
+-        guidance_scale=1.0,
+         enable_normalization=True,
+         normalization_db=-1.0,
+         reference_audio=safe_ref_audio,
+@@ -136,18 +226,24 @@ def main():
+     )
+ 
+     t0 = time.time()
+-    result = generate_music(dit_handler, llm_handler, params=params, config=config, save_dir=str(temp_save_dir))
++    try:
++        result = generate_music(dit_handler, llm_handler, params=params, config=config,
++                                save_dir=str(temp_save_dir))
++    except Exception as e:  # noqa: BLE001
++        fail(f"generate_music 실행 중 예외: {e}")
+     elapsed = time.time() - t0
+ 
+-    if result.success and result.audios:
++    if getattr(result, "success", False) and getattr(result, "audios", None):
+         gen_file = result.audios[0]["path"]
+-        print(f"[acestep-official] Generated in {elapsed:.1f}s -> {gen_file}")
++        print(f"[acestep-official] 생성 완료 ({elapsed:.1f}s) -> {gen_file}")
+         shutil.copy2(gen_file, str(out_path))
+-        print(f"[acestep-official] Copied to final output: {out_path} ({out_path.stat().st_size} bytes)")
++        print(f"[acestep-official] 최종 출력: {out_path} ({out_path.stat().st_size} bytes)")
+         return 0
+-    else:
+-        print(f"[acestep-official] Generation failed: {result.status_message} / error: {result.error}")
+-        return 1
++
++    msg = getattr(result, "status_message", "") or ""
++    err = getattr(result, "error", "") or ""
++    fail(f"생성 실패: {msg} / error: {err}", code=1)
++
+ 
+ if __name__ == "__main__":
+     sys.exit(main())
+diff --git a/ebook_writer.py b/ebook_writer.py
+index 38169a1..e4571ef 100644
+--- a/ebook_writer.py
++++ b/ebook_writer.py
+@@ -430,18 +430,25 @@ def generate_and_save_ebook(
+             full_text += f"{i+1}. {ch.get('title')}\n"
+         full_text += "\n---\n\n"
+ 
++        # 실행 요약(running summary) — 챕터 간 일관성 유지용 메모리
++        story_memory = ""
++
+         for idx, ch in enumerate(chapters):
+             ch_title = ch.get("title", f"제{idx+1}장")
+             ch_summary = ch.get("summary", "")
+             log_func(f"✍️ [{idx+1}/{total_steps}] '{ch_title}' 집필 중...")
+ 
++            memory_block = ""
++            if story_memory:
++                memory_block = f"\n[지금까지 집필된 내용 요약 - 앞 내용과 모순되지 않게 이어서 쓸 것]\n{story_memory}\n"
++
+             prompt = f"""당신은 '{topic}' 분야의 최고 권위자이자 전문 저술가입니다.
+ 전체 전자책 기획에 맞춰, 아래 챕터의 원고를 최소 3,000자 이상으로 깊이 있고 풍부하게 작성하십시오.
+ 
+ [현재 집필할 챕터]
+ 제목: {ch_title}
+ 핵심 요강: {ch_summary}
+-
++{memory_block}
+ [전체 주제]
+ {topic}
+ 
+@@ -449,12 +456,25 @@ def generate_and_save_ebook(
+ 1. 실제 통계, 역사적/현대적 사례, 구체적인 예시와 비유를 풍부하게 포함할 것.
+ 2. 단순 나열을 피하고 기승전결이 있는 서술형 문장으로 깊이 있게 전개할 것.
+ 3. 세부 소제목(### 1. ..., ### 2. ..., ### 3. ...)을 명확히 나누어 독자가 몰입할 수 있도록 할 것.
+-4. 책의 한 장이므로 챕터 제목(## {ch_title})으로 시작할 것."""
++4. 책의 한 장이므로 챕터 제목(## {ch_title})으로 시작할 것.
++5. 앞 챕터에서 이미 설명한 내용을 반복하지 말고, 필요하면 '앞 장에서 언급했듯이'로 연결할 것."""
+ 
+             ch_content = call_ollama(prompt, model=model, port=port, max_tokens=8192)
+             full_text += f"\n\n## {ch_title}\n\n{ch_content}\n\n---\n"
+             log_func(f"   ✓ '{ch_title}' 완료 ({len(ch_content):,}자)")
+ 
++            # 다음 챕터를 위한 실행 요약 갱신
++            try:
++                sum_prompt = (
++                    "아래 챕터 원고의 핵심 논지, 인물/사례, 결론을 3문장 이내로 요약하십시오. "
++                    "요약만 출력하십시오.\n\n" + ch_content
++                )
++                ch_digest = call_ollama(sum_prompt, model=model, port=port, max_tokens=512)
++                if ch_digest:
++                    story_memory = (story_memory + f"\n- [{ch_title}] {ch_digest.strip()}").strip()
++            except Exception:
++                pass
++
+     elapsed = int(time.time() - start_time)
+     em, es = divmod(elapsed, 60)
+     log_func(f"🎉 [집필 완료] 총 {len(full_text):,}자 / 소요 시간: {em}분 {es}초")
+diff --git a/gpt_sovits/inference.py b/gpt_sovits/inference.py
+index 0951ff5..70afc2f 100644
+--- a/gpt_sovits/inference.py
++++ b/gpt_sovits/inference.py
+@@ -50,34 +50,70 @@ def read_source_text(text_file: Path) -> str:
+ 
+ 
+ def synthesize_speech(text: str, sample_rate: int = 24000) -> np.ndarray:
+-    # 1. 고품질 한국어 Neural TTS (edge-tts)
++    """원문 전체(마크다운 정제 후)를 낭독한다. 기존의 400자 컷은 제거.
++    edge-tts 는 긴 텍스트를 청크(약 900자)로 나눠 생성한 뒤 이어 붙인다."""
++    def clean_for_tts(raw: str) -> str:
++        t = re.sub(r'```.*?```', ' 코드 생략 ', raw, flags=re.S)
++        t = re.sub(r'[#*`\[\]()>|_]', ' ', t)
++        t = re.sub(r'https?://\S+', ' 링크 ', t)
++        t = re.sub(r'\s+', ' ', t)
++        return t.strip()
++
++    narration_text = clean_for_tts(text)
++    if not narration_text:
++        narration_text = "낭독할 본문이 없습니다."
++
++    # 1. 고품질 한국어 Neural TTS (edge-tts) - 전문 낭독
+     try:
+         import asyncio
+         import edge_tts
+         import io
+         import tempfile
+ 
+-        # 전자책 서두 핵심 본문 400자 추출 (마크다운 헤더 및 특수문자 정리)
+-        narration_text = re.sub(r'[#*`\[\]\(\)>_-]', ' ', text[:500])
+-        narration_text = ' '.join(narration_text.split())
+-
+-        temp_mp3 = tempfile.mktemp(suffix=".mp3")
+-        async def _speak():
+-            comm = edge_tts.Communicate(narration_text, "ko-KR-InJoonNeural")
+-            await comm.save(temp_mp3)
+-
+-        asyncio.run(_speak())
+-        if Path(temp_mp3).exists() and Path(temp_mp3).stat().st_size > 1000:
+-            import soundfile as sf
+-            y, sr = sf.read(temp_mp3)
+-            try:
+-                os.remove(temp_mp3)
+-            except Exception:
+-                pass
+-            if y.ndim > 1:
+-                y = y.mean(axis=1)
+-            print(f"[gpt_sovits] Synthesized via Korean Neural TTS (edge-tts): {len(y)} samples ({len(y)/sr:.1f}s)")
+-            return y.astype(np.float32)
++        CHUNK = 900  # 문장 경계 기준 청크
++        chunks = []
++        start = 0
++        while start < len(narration_text):
++            end = min(start + CHUNK, len(narration_text))
++            if end < len(narration_text):
++                m = None
++                for punct in ('.', '!', '?', '다.', '요.', '니다.'):
++                    p = narration_text.rfind(punct, start, end)
++                    if p > start:
++                        m = max(m or 0, p + len(punct))
++                if m:
++                    end = m
++            chunks.append(narration_text[start:end].strip())
++            start = end
++
++        async def _speak_all():
++            parts = []
++            for i, ch in enumerate(chunks):
++                if not ch:
++                    continue
++                temp_mp3 = tempfile.mktemp(suffix=".mp3")
++                comm = edge_tts.Communicate(ch, "ko-KR-InJoonNeural", rate="-4%")
++                await comm.save(temp_mp3)
++                if Path(temp_mp3).exists() and Path(temp_mp3).stat().st_size > 500:
++                    y, sr = sf.read(temp_mp3)
++                    if y.ndim > 1:
++                        y = y.mean(axis=1)
++                    parts.append(y.astype(np.float32))
++                    # 문장/청크 사이 자연스러운 호흡 간격
++                    parts.append(np.zeros(int(sr * 0.35), dtype=np.float32))
++                try:
++                    os.remove(temp_mp3)
++                except Exception:
++                    pass
++                print(f"[gpt_sovits] 낭독 청크 {i+1}/{len(chunks)} 완료")
++            return parts
++
++        parts = asyncio.run(_speak_all())
++        if parts:
++            full = np.concatenate(parts)
++            print(f"[gpt_sovits] Synthesized via Korean Neural TTS (edge-tts): "
++                  f"{len(full)} samples ({len(full)/sr:.1f}s, {len(narration_text)}자 전문)")
++            return full
+     except Exception as e:
+         print(f"[gpt_sovits] Edge-TTS error, trying fallback (info: {e})")
+ 
+diff --git a/jobs.json b/jobs.json
+index 79b0e64..03d7e89 100644
+--- a/jobs.json
++++ b/jobs.json
+@@ -13,7 +13,7 @@
+   },
+   "commands": {
+     "text": "builtin-ollama-api",
+-    "music": "acestep --prompt-file {prompt_file} --output {out} --duration {duration}",
++    "music": "acestep.bat --prompt-file {prompt_file} --lyrics-file {lyrics_file} --output {out} --duration {duration}",
+     "tts": "python -m gpt_sovits.inference --text-file {prompt_file} --output {out}"
+   },
+   "jobs": [
+@@ -36,7 +36,8 @@
+       "phase": "text",
+       "kind": "text",
+       "out": "lyrics-01.txt",
+-      "prompt": "주제: 밤하늘의 별을 보며 지나간 청춘의 방황과 새로운 희망을 노래하는 서정적인 한국어 어쿠스틱 발라드 가사\n\n[형식 요구사항]\n반드시 아래 라벨을 사용하여 기승전결 구조를 완성할 것:\n[Verse 1] (1절: 늦은 밤 창가에서 느껴지는 고요함과 지난날의 회상)\n[Chorus] (후렴: 어둠 속에서도 빛나는 별처럼 다시 일어서겠다는 다짐)\n[Verse 2] (2절: 넘어졌던 시간들이 나를 자라게 했다는 깨달음)\n[Chorus] (후렴: 감정의 고조와 희망의 메시지)\n[Bridge] (브릿지: 마음 깊은 곳의 고백과 위로)\n[Outro] (아웃트로: 여운을 남기는 마무리 잔향)"
++      "prompt": "당신은 히트곡을 만들어낸 베테랑 작사가입니다. 아래 주제로 실제로 노래할 수 있는 한국어 가사를 작성하라.\n\n주제: 밤하늘의 별을 보며 지나간 청춘의 방황과 새로운 희망을 노래하는 서정적인 어쿠스틱 발라드\n\n[형식 요구사항 - 반드시 준수]\n1. 아래 라벨을 그대로 사용할 것: [Verse 1], [Chorus], [Verse 2], [Bridge], [Outro]\n2. 각 절은 4행, 한 행은 14음절 전후(한국어 대중가사 표준)로 맞출 것\n3. 후렴은 반복 가능한 훅(hook)이 있어야 하며, 같은 행 구조를 유지할 것\n4. ACE-Step 음악 모델이 인식하는 섹션 라벨 형식을 사용하므로 라벨 외 설명문을 붙이지 말 것\n5. 라벨 바로 아래에 가사 행만 출력할 것 (예시 아님)\n\n[출력 예시 형식]\n[Verse 1]\n(4행 가사)\n\n[Chorus]\n(4행 가사)",
++      "lyrics_style": "emotional Korean female vocals, clear expressive singing voice, slow emotional acoustic ballad, acoustic guitar arpeggio, soft piano, 65 bpm"
+     },
+     {
+       "id": "song-01",
+@@ -44,6 +45,7 @@
+       "kind": "music",
+       "out": "song-01.mp3",
+       "duration": 60,
++      "lyrics_from": "lyrics-01",
+       "prompt": "emotional Korean female vocals, clear expressive singing voice, slow emotional acoustic ballad, acoustic guitar arpeggio, soft piano, 65 bpm"
+     },
+     {
+diff --git a/overnight_batch.py b/overnight_batch.py
+index 9286c0d..910c8d0 100644
+--- a/overnight_batch.py
++++ b/overnight_batch.py
+@@ -69,8 +69,8 @@ DEFAULT_CONFIG = {
+     },
+     "retry": {"max_attempts": 3, "backoff_sec": 10},
+     "commands": {
+-        "text": "builtin-ollama-api",
+-        "music": "acestep --prompt-file {prompt_file} --output {out} --duration {duration}",
++    "text": "builtin-ollama-api",
++    "music": "acestep.bat --prompt-file {prompt_file} --lyrics-file {lyrics_file} --output {out} --duration {duration}",
+         "tts": "python -m gpt_sovits.inference --text-file {prompt_file} --output {out}",
+     },
+     "jobs": [
+@@ -269,20 +269,71 @@ def preflight(cfg, log) -> None:
+ # ----------------------------------------------------------------------------
+ # 작업 실행
+ # ----------------------------------------------------------------------------
+-def run_text_job(job, cfg, log, dry_run: bool = False) -> None:
+-    workdir = Path(cfg["workdir"])
++def validate_lyrics_structure(text: str, jid: str = "") -> bool:
++    """가사 텍스트에 절/후렴 구조 라벨이 있는지 확인 (경고용)."""
++    lines = [l.strip() for l in text.splitlines() if l.strip()]
++    return any(
++        re.search(r'\[(Verse|Chorus|Bridge|Outro|Intro|Pre-Chorus|1절|2절|후렴|브릿지)\]', l, re.I)
++        for l in lines
++    )
++
++
++def polish_ebook_text(job, text: str, cfg, log, dry_run: bool = False) -> str:
++    """전자책 원고 품질 향상: 1) 비평(Self-Critique) 2) 비평 반영 재작성.
++    재작성본이 검증을 통과하지 못하거나 지나치게 짧으면 원본을 유지한다."""
+     model = job.get("model") or cfg["text_model"]
+-    log("INFO", f"{job['id']}: ollama/{model} 호출")
+-    resp = api_post(
+-        "/api/generate",
+-        {"model": model, "prompt": job["prompt"], "stream": False},
+-        timeout=int(job.get("timeout_sec", 3600)),
+-        dry_run=dry_run,
++
++    log("INFO", f"{job['id']}: [다듬기 1/2] 자기 비평(Self-Critique) 생성...")
++    critique_prompt = (
++        "당신은 출판사 시니어 편집자입니다. 아래 전자책 원고를 검토하여 개선점을 도출하십시오.\n\n"
++        "[검토 관점]\n"
++        "1. 사실성: 통계/사례가 부정확하거나 출처가 불명확한 주장\n"
++        "2. 구조: 목차-본문 불일치, 전개 불균형, 결론 부재\n"
++        "3. 문장: 중복 표현, 번역투, 비문\n"
++        "4. 깊이: 피상적 나열, 구체적 사례/숫자 부족\n\n"
++        "개선점을 우선순위별로 최대 7개, 각 항목에 구체적 수정 지시를 포함해 요약하십시오.\n\n"
++        "[원고]\n" + text
+     )
+-    text = (resp or {}).get("response", "")
+-    if dry_run:
+-        text = f"[dry-run] {job['id']} 결과 본문\n"
+-def validate_text_output(job, text: str, path: Path) -> None:
++    resp = api_post("/api/generate", {"model": model, "prompt": critique_prompt, "stream": False,
++                                      "options": {"num_ctx": 16384, "temperature": 0.3}},
++                    timeout=int(job.get("timeout_sec", 3600)), dry_run=dry_run)
++    critique = (resp or {}).get("response", "").strip()
++    if not critique:
++        log("WARN", f"{job['id']}: 비평 생성 실패 — 원본 유지")
++        return text
++
++    log("INFO", f"{job['id']}: [다듬기 2/2] 비평 반영 재작성...")
++    revise_prompt = (
++        "당신은 해당 분야의 전문 저술가입니다. 아래 원고와 편집자 비평을 바탕으로 원고를 전면 수정하십시오.\n\n"
++        "[규칙]\n"
++        "1. 원고의 목차/챕터 구조와 마크다운 형식(#, ##, ###)은 반드시 유지할 것\n"
++        "2. 비평의 모든 항목을 반영하되 분량은 원본 이상으로 유지할 것\n"
++        "3. 사실 확인이 불가능한 수치는 단정 대신 '알려져 있다' 수준으로 완화할 것\n"
++        "4. 수정된 원고 본문만 출력하고 부연 설명을 덧붙이지 말 것\n\n"
++        f"[편집자 비평]\n{critique}\n\n[원고]\n{text}"
++    )
++    resp = api_post("/api/generate", {"model": model, "prompt": revise_prompt, "stream": False,
++                                      "options": {"num_ctx": 16384, "temperature": 0.5}},
++                    timeout=int(job.get("timeout_sec", 3600)), dry_run=dry_run)
++    revised = (resp or {}).get("response", "").strip()
++    if not revised:
++        log("WARN", f"{job['id']}: 재작성 실패 — 원본 유지")
++        return text
++
++    if len(revised) < int(len(text) * 0.8):
++        log("WARN", f"{job['id']}: 재작성본이 원본의 80% 미만({len(revised)}자 < {int(len(text)*0.8)}자) — 원본 유지")
++        return text
++    try:
++        validate_text_output(job, revised, Path("/dev/null"))
++    except Exception as e:  # noqa: BLE001
++        log("WARN", f"{job['id']}: 재작성본 DoD 검증 실패({e}) — 원본 유지")
++        return text
++
++    log("OK", f"{job['id']}: 다듬기 완료 ({len(text)}자 -> {len(revised)}자)")
++    return revised
++
++
++def run_text_job(job, cfg, log, dry_run: bool = False) -> None:
+     jid = job.get("id", "")
+     stripped = text.strip()
+     if not stripped:
+@@ -371,6 +422,16 @@ def run_text_job(job, cfg, log, dry_run: bool = False) -> None:
+         text = f"[dry-run] {job['id']} 결과 본문\n# 목차\n## 1장\n## 2장\n[Verse 1]\n노래\n[Chorus]\n후렴\n출처: 테스트\n" + "글" * 3000
+     if not text.strip():
+         raise RuntimeError("LLM 응답이 비어 있음")
++
++    # 전자책 원고는 비평-재작성(Self-Critique) 패스로 품질 향상
++    if not dry_run and cfg.get("ebook_polish", True) and (
++        "ebook" in job.get("id", "") or "원고" in job.get("prompt", "")
++    ):
++        try:
++            text = polish_ebook_text(job, text, cfg, log)
++        except Exception as e:  # noqa: BLE001
++            log("WARN", f"{job['id']}: 다듬기 중 오류 — 원본 유지: {e}")
++
+     out = workdir / job["out"]
+     out.parent.mkdir(parents=True, exist_ok=True)
+     out.write_text(text, encoding="utf-8")
+@@ -407,12 +468,35 @@ def run_audio_job(job, cfg, log, dry_run: bool = False) -> None:
+     prompt_file.parent.mkdir(parents=True, exist_ok=True)
+     prompt_file.write_text(job["prompt"], encoding="utf-8")
+ 
++    # 음악 job: 가사 파일 연결 (lyrics_file 직접 지정 or lyrics_from 으로 text job 출력 참조)
++    lyrics_file = ""
++    if kind == "music":
++        lf = None
++        if job.get("lyrics_file"):
++            lf = Path(job["lyrics_file"])
++            if not lf.is_absolute():
++                lf = workdir / lf
++        elif job.get("lyrics_from"):
++            src = str(job["lyrics_from"])
++            lf = workdir / (src if src.endswith(".txt") else f"{src}.txt")
++        elif job.get("lyrics", "").strip():
++            lf = workdir / f"{job['id']}.lyrics.txt"
++            lf.write_text(job["lyrics"], encoding="utf-8")
++        if lf is not None and Path(lf).exists() and Path(lf).stat().st_size > 0:
++            lyrics_file = str(lf)
++            if not validate_lyrics_structure(Path(lf).read_text(encoding="utf-8")):
++                log("WARN", f"{job['id']}: 가사에 [Verse]/[Chorus] 구조 라벨이 없습니다 — ACE-Step이 구조를 자체 추정합니다")
++            log("INFO", f"{job['id']}: 가사 파일 연결 -> {lf}")
++        else:
++            log("WARN", f"{job['id']}: 가사 파일을 찾지 못했습니다 — 반주(연주곡)로 생성됩니다 (job에 lyrics_from 지정 권장)")
++
+     out = workdir / job["out"]
+     cmd = tpl.format(
+         prompt_file=q(prompt_file),
+         out=q(out),
+         duration=int(job.get("duration", 60)),
+         prompt=q(job["prompt"]),
++        lyrics_file=q(lyrics_file),
+     )
+     if re.search(r"\bollama\b", cmd, re.I):  # 방어적 재확인
+         raise RuntimeError("PHASE2 명령에 ollama 발견 — 차단")

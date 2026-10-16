@@ -13,7 +13,7 @@
   },
   "commands": {
     "text": "builtin-ollama-api",
-    "music": "acestep --prompt-file {prompt_file} --output {out} --duration {duration}",
+    "music": "acestep.bat --prompt-file {prompt_file} --lyrics-file {lyrics_file} --output {out} --duration {duration}",
     "tts": "python -m gpt_sovits.inference --text-file {prompt_file} --output {out}"
   },
   "jobs": [
@@ -36,7 +36,8 @@
       "phase": "text",
       "kind": "text",
       "out": "lyrics-01.txt",
-      "prompt": "주제: 밤하늘의 별을 보며 지나간 청춘의 방황과 새로운 희망을 노래하는 서정적인 한국어 어쿠스틱 발라드 가사\n\n[형식 요구사항]\n반드시 아래 라벨을 사용하여 기승전결 구조를 완성할 것:\n[Verse 1] (1절: 늦은 밤 창가에서 느껴지는 고요함과 지난날의 회상)\n[Chorus] (후렴: 어둠 속에서도 빛나는 별처럼 다시 일어서겠다는 다짐)\n[Verse 2] (2절: 넘어졌던 시간들이 나를 자라게 했다는 깨달음)\n[Chorus] (후렴: 감정의 고조와 희망의 메시지)\n[Bridge] (브릿지: 마음 깊은 곳의 고백과 위로)\n[Outro] (아웃트로: 여운을 남기는 마무리 잔향)"
+      "prompt": "당신은 히트곡을 만들어낸 베테랑 작사가입니다. 아래 주제로 실제로 노래할 수 있는 한국어 가사를 작성하라.\n\n주제: 밤하늘의 별을 보며 지나간 청춘의 방황과 새로운 희망을 노래하는 서정적인 어쿠스틱 발라드\n\n[형식 요구사항 - 반드시 준수]\n1. 아래 라벨을 그대로 사용할 것: [Verse 1], [Chorus], [Verse 2], [Bridge], [Outro]\n2. 각 절은 4행, 한 행은 14음절 전후(한국어 대중가사 표준)로 맞출 것\n3. 후렴은 반복 가능한 훅(hook)이 있어야 하며, 같은 행 구조를 유지할 것\n4. ACE-Step 음악 모델이 인식하는 섹션 라벨 형식을 사용하므로 라벨 외 설명문을 붙이지 말 것\n5. 라벨 바로 아래에 가사 행만 출력할 것 (예시 아님)\n\n[출력 예시 형식]\n[Verse 1]\n(4행 가사)\n\n[Chorus]\n(4행 가사)",
+      "lyrics_style": "emotional Korean female vocals, clear expressive singing voice, slow emotional acoustic ballad, acoustic guitar arpeggio, soft piano, 65 bpm"
     },
     {
       "id": "song-01",
@@ -44,6 +45,7 @@
       "kind": "music",
       "out": "song-01.mp3",
       "duration": 60,
+      "lyrics_from": "lyrics-01",
       "prompt": "emotional Korean female vocals, clear expressive singing voice, slow emotional acoustic ballad, acoustic guitar arpeggio, soft piano, 65 bpm"
     },
     {

@@ -69,8 +69,8 @@ DEFAULT_CONFIG = {
     },
     "retry": {"max_attempts": 3, "backoff_sec": 10},
     "commands": {
-        "text": "builtin-ollama-api",
-        "music": "acestep --prompt-file {prompt_file} --output {out} --duration {duration}",
+    "text": "builtin-ollama-api",
+    "music": "acestep.bat --prompt-file {prompt_file} --lyrics-file {lyrics_file} --output {out} --duration {duration}",
         "tts": "python -m gpt_sovits.inference --text-file {prompt_file} --output {out}",
     },
     "jobs": [
@@ -269,20 +269,71 @@ def preflight(cfg, log) -> None:
 # ----------------------------------------------------------------------------
 # 작업 실행
 # ----------------------------------------------------------------------------
-def run_text_job(job, cfg, log, dry_run: bool = False) -> None:
-    workdir = Path(cfg["workdir"])
-    model = job.get("model") or cfg["text_model"]
-    log("INFO", f"{job['id']}: ollama/{model} 호출")
-    resp = api_post(
-        "/api/generate",
-        {"model": model, "prompt": job["prompt"], "stream": False},
-        timeout=int(job.get("timeout_sec", 3600)),
-        dry_run=dry_run,
+def validate_lyrics_structure(text: str, jid: str = "") -> bool:
+    """가사 텍스트에 절/후렴 구조 라벨이 있는지 확인 (경고용)."""
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    return any(
+        re.search(r'\[(Verse|Chorus|Bridge|Outro|Intro|Pre-Chorus|1절|2절|후렴|브릿지)\]', l, re.I)
+        for l in lines
     )
-    text = (resp or {}).get("response", "")
-    if dry_run:
-        text = f"[dry-run] {job['id']} 결과 본문\n"
-def validate_text_output(job, text: str, path: Path) -> None:
+
+
+def polish_ebook_text(job, text: str, cfg, log, dry_run: bool = False) -> str:
+    """전자책 원고 품질 향상: 1) 비평(Self-Critique) 2) 비평 반영 재작성.
+    재작성본이 검증을 통과하지 못하거나 지나치게 짧으면 원본을 유지한다."""
+    model = job.get("model") or cfg["text_model"]
+
+    log("INFO", f"{job['id']}: [다듬기 1/2] 자기 비평(Self-Critique) 생성...")
+    critique_prompt = (
+        "당신은 출판사 시니어 편집자입니다. 아래 전자책 원고를 검토하여 개선점을 도출하십시오.\n\n"
+        "[검토 관점]\n"
+        "1. 사실성: 통계/사례가 부정확하거나 출처가 불명확한 주장\n"
+        "2. 구조: 목차-본문 불일치, 전개 불균형, 결론 부재\n"
+        "3. 문장: 중복 표현, 번역투, 비문\n"
+        "4. 깊이: 피상적 나열, 구체적 사례/숫자 부족\n\n"
+        "개선점을 우선순위별로 최대 7개, 각 항목에 구체적 수정 지시를 포함해 요약하십시오.\n\n"
+        "[원고]\n" + text
+    )
+    resp = api_post("/api/generate", {"model": model, "prompt": critique_prompt, "stream": False,
+                                      "options": {"num_ctx": 16384, "temperature": 0.3}},
+                    timeout=int(job.get("timeout_sec", 3600)), dry_run=dry_run)
+    critique = (resp or {}).get("response", "").strip()
+    if not critique:
+        log("WARN", f"{job['id']}: 비평 생성 실패 — 원본 유지")
+        return text
+
+    log("INFO", f"{job['id']}: [다듬기 2/2] 비평 반영 재작성...")
+    revise_prompt = (
+        "당신은 해당 분야의 전문 저술가입니다. 아래 원고와 편집자 비평을 바탕으로 원고를 전면 수정하십시오.\n\n"
+        "[규칙]\n"
+        "1. 원고의 목차/챕터 구조와 마크다운 형식(#, ##, ###)은 반드시 유지할 것\n"
+        "2. 비평의 모든 항목을 반영하되 분량은 원본 이상으로 유지할 것\n"
+        "3. 사실 확인이 불가능한 수치는 단정 대신 '알려져 있다' 수준으로 완화할 것\n"
+        "4. 수정된 원고 본문만 출력하고 부연 설명을 덧붙이지 말 것\n\n"
+        f"[편집자 비평]\n{critique}\n\n[원고]\n{text}"
+    )
+    resp = api_post("/api/generate", {"model": model, "prompt": revise_prompt, "stream": False,
+                                      "options": {"num_ctx": 16384, "temperature": 0.5}},
+                    timeout=int(job.get("timeout_sec", 3600)), dry_run=dry_run)
+    revised = (resp or {}).get("response", "").strip()
+    if not revised:
+        log("WARN", f"{job['id']}: 재작성 실패 — 원본 유지")
+        return text
+
+    if len(revised) < int(len(text) * 0.8):
+        log("WARN", f"{job['id']}: 재작성본이 원본의 80% 미만({len(revised)}자 < {int(len(text)*0.8)}자) — 원본 유지")
+        return text
+    try:
+        validate_text_output(job, revised, Path("/dev/null"))
+    except Exception as e:  # noqa: BLE001
+        log("WARN", f"{job['id']}: 재작성본 DoD 검증 실패({e}) — 원본 유지")
+        return text
+
+    log("OK", f"{job['id']}: 다듬기 완료 ({len(text)}자 -> {len(revised)}자)")
+    return revised
+
+
+def run_text_job(job, cfg, log, dry_run: bool = False) -> None:
     jid = job.get("id", "")
     stripped = text.strip()
     if not stripped:
@@ -371,6 +422,16 @@ def run_text_job(job, cfg, log, dry_run: bool = False) -> None:
         text = f"[dry-run] {job['id']} 결과 본문\n# 목차\n## 1장\n## 2장\n[Verse 1]\n노래\n[Chorus]\n후렴\n출처: 테스트\n" + "글" * 3000
     if not text.strip():
         raise RuntimeError("LLM 응답이 비어 있음")
+
+    # 전자책 원고는 비평-재작성(Self-Critique) 패스로 품질 향상
+    if not dry_run and cfg.get("ebook_polish", True) and (
+        "ebook" in job.get("id", "") or "원고" in job.get("prompt", "")
+    ):
+        try:
+            text = polish_ebook_text(job, text, cfg, log)
+        except Exception as e:  # noqa: BLE001
+            log("WARN", f"{job['id']}: 다듬기 중 오류 — 원본 유지: {e}")
+
     out = workdir / job["out"]
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(text, encoding="utf-8")
@@ -407,12 +468,35 @@ def run_audio_job(job, cfg, log, dry_run: bool = False) -> None:
     prompt_file.parent.mkdir(parents=True, exist_ok=True)
     prompt_file.write_text(job["prompt"], encoding="utf-8")
 
+    # 음악 job: 가사 파일 연결 (lyrics_file 직접 지정 or lyrics_from 으로 text job 출력 참조)
+    lyrics_file = ""
+    if kind == "music":
+        lf = None
+        if job.get("lyrics_file"):
+            lf = Path(job["lyrics_file"])
+            if not lf.is_absolute():
+                lf = workdir / lf
+        elif job.get("lyrics_from"):
+            src = str(job["lyrics_from"])
+            lf = workdir / (src if src.endswith(".txt") else f"{src}.txt")
+        elif job.get("lyrics", "").strip():
+            lf = workdir / f"{job['id']}.lyrics.txt"
+            lf.write_text(job["lyrics"], encoding="utf-8")
+        if lf is not None and Path(lf).exists() and Path(lf).stat().st_size > 0:
+            lyrics_file = str(lf)
+            if not validate_lyrics_structure(Path(lf).read_text(encoding="utf-8")):
+                log("WARN", f"{job['id']}: 가사에 [Verse]/[Chorus] 구조 라벨이 없습니다 — ACE-Step이 구조를 자체 추정합니다")
+            log("INFO", f"{job['id']}: 가사 파일 연결 -> {lf}")
+        else:
+            log("WARN", f"{job['id']}: 가사 파일을 찾지 못했습니다 — 반주(연주곡)로 생성됩니다 (job에 lyrics_from 지정 권장)")
+
     out = workdir / job["out"]
     cmd = tpl.format(
         prompt_file=q(prompt_file),
         out=q(out),
         duration=int(job.get("duration", 60)),
         prompt=q(job["prompt"]),
+        lyrics_file=q(lyrics_file),
     )
     if re.search(r"\bollama\b", cmd, re.I):  # 방어적 재확인
         raise RuntimeError("PHASE2 명령에 ollama 발견 — 차단")
