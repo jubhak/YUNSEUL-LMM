@@ -30,6 +30,24 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
 ACESTEP_ROOT = Path(__file__).resolve().parent / "ACE-Step-1.5"
+if str(ACESTEP_ROOT) not in sys.path:
+    sys.path.insert(0, str(ACESTEP_ROOT))
+
+# transformers 4.49+ 및 vector_quantize_pytorch 연동 시 meta device 환경에서
+# Tensor.item() 호출로 인한 크래시(RuntimeError: Tensor.item() cannot be called on meta tensors) 방지
+import torch
+import transformers.modeling_utils
+
+_orig_get_init_context = transformers.modeling_utils.PreTrainedModel.get_init_context
+
+
+@classmethod
+def _safe_get_init_context(cls, *args, **kwargs):
+    ctxs = _orig_get_init_context(*args, **kwargs)
+    return [c for c in ctxs if not (isinstance(c, torch.device) and c.type == "meta")]
+
+
+transformers.modeling_utils.PreTrainedModel.get_init_context = _safe_get_init_context
 
 
 def fail(msg: str, code: int = 2):
