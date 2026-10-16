@@ -33,21 +33,6 @@ ACESTEP_ROOT = HERE / "ACE-Step-1.5"
 sys.path.insert(0, str(ACESTEP_ROOT))
 sys.path.insert(0, str(HERE))  # audio_verify
 
-# transformers 4.49+ / 5.x 환경에서 FSQ .item() 메타 텐서 에러 방지
-import torch
-import transformers.modeling_utils
-
-_orig_get_init_context = transformers.modeling_utils.PreTrainedModel.get_init_context
-
-
-@classmethod
-def _safe_get_init_context(cls, *args, **kwargs):
-    ctxs = _orig_get_init_context(*args, **kwargs)
-    return [c for c in ctxs if not (isinstance(c, torch.device) and c.type == "meta")]
-
-
-transformers.modeling_utils.PreTrainedModel.get_init_context = _safe_get_init_context
-
 TAG = "[acestep-official]"
 WEIGHT_EXT = (".safetensors", ".bin", ".pt", ".pth")
 
