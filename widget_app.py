@@ -36,9 +36,15 @@ from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
 
 def get_base_dir():
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent
+    if not getattr(sys, "frozen", False):
+        return Path(__file__).resolve().parent
+    # exe 를 dist/ 나 바탕화면 등 다른 곳에 두어도 audio_engines 가 있는 프로젝트 폴더를 찾는다.
+    exe_dir = Path(sys.executable).resolve().parent
+    candidates = [exe_dir, *exe_dir.parents, exe_dir / "YUNSEUL-LMM", Path(r"D:\workspace\YUNSEUL-LMM")]
+    for d in candidates:
+        if (d / "audio_engines" / "acestep_official_runner.py").exists():
+            return d
+    return exe_dir
 
 def get_resource_path(filename):
     if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
@@ -57,41 +63,11 @@ BOOKS_DIR = BASE_DIR / "books"
 BOOKS_DIR.mkdir(parents=True, exist_ok=True)
 TRAINED_MODELS_DIR = BASE_DIR / "trained_vocal_models"
 TRAINED_MODELS_DIR.mkdir(parents=True, exist_ok=True)
+ACESTEP_PY = BASE_DIR / "audio_engines" / "venv_acestep" / "Scripts" / "python.exe"
 
-from ebook_writer import save_ebook_auto_increment, markdown_to_book_html
-
-MUSIC_GENRE_PRESETS = {
-    "ballad_acoustic": {
-        "title": "🎹 감성 어쿠스틱 발라드 (Acoustic Ballad, 65 BPM)",
-        "prompt": "emotional Korean female vocals, clear singing voice, emotional acoustic ballad, warm acoustic guitar, soft grand piano, melancholic strings, 65 bpm, sentimental melodious chorus",
-        "sample_lyrics": "[Verse 1]\n가로등 불빛 아래 서성이던 밤\n바람결에 실려온 너의 목소리\n잊은 줄 알았던 기억들이\n다시 내 맘을 두드리네요\n\n[Chorus]\n우리의 계절은 지나갔지만\n그리움은 늘 같은 자리에\n눈을 감으면 번져오는 그대\n아직도 내 마음에 머물러 있네요\n\n[Bridge]\n시간이 흐르면 무뎌질 거란 말\n모두 거짓이었나 봐요\n\n[Chorus]\n우리의 계절은 지나갔지만\n그리움은 늘 같은 자리에\n눈을 감으면 번져오는 그대\n여전히 사랑인 것 같아요"
-    },
-    "ballad_orchestral": {
-        "title": "🎻 웅장한 오케스트라 팝 발라드 (Orchestral Pop Ballad, 72 BPM)",
-        "prompt": "powerful passionate Korean female vocals, dramatic orchestral pop ballad, grand piano, sweeping cello and violin ensemble, emotional cinematic build-up, 72 bpm, heartfelt singing",
-        "sample_lyrics": "[Verse 1]\n조용한 어둠 속에 울려 퍼지는\n작은 숨소리마저 눈물이 되어\n혼자 남겨진 이 거리를 걸으며\n그리운 이름을 불러봅니다\n\n[Chorus]\n더 찬란하게 빛나던 너와 나의 순간들\n이젠 영원한 멜로디가 되어 울리네\n가슴 깊이 새겨진 그대라는 빛\n시간을 건너 그대에게 닿기를\n\n[Outro]\n영원히 기억할게요\n우리의 찬란했던 날들을"
-    },
-    "kpop_dance": {
-        "title": "⚡ 트렌디 K-POP 댄스 & 팝 (Trendy K-Pop Dance Pop, 122 BPM)",
-        "prompt": "energetic bright Korean vocals, trendy K-pop dance pop, punchy dynamic 808 synth bass, catchy repetitive vocal hook, crisp modern drums, EDM pop drop, high energy, 122 bpm",
-        "sample_lyrics": "[Intro]\nYeah, listen up!\nLet's get it started now!\n\n[Verse 1]\n어둠을 깨우는 비트 소리에\n심장이 쿵쿵 뛰기 시작해\n눈부신 스포트라이트가 날 비출 때\n망설일 필요 없어, 시작해!\n\n[Pre-Chorus]\n점점 더 뜨거워지는 리듬 속에\n더 높이 날아올라 Sky high!\n\n[Chorus]\nDance all night, 멈추지 마 우리 템포\n불꽃처럼 터져 번지는 Spotlight!\n온 세상이 우리 무대가 돼\nCan't stop the feeling, we own the night!\n\n[Outro]\nYeah! We never stop!"
-    },
-    "kpop_rnb": {
-        "title": "✨ 감성 K-POP R&B / 어반 그루브 (K-Pop Urban R&B, 90 BPM)",
-        "prompt": "smooth seductive Korean vocals, trendy K-pop urban R&B, groovy deep bassline, dreamy vintage Rhodes piano, mellow crisp snap snare, soulful vocal runs, sensual late night mood, 90 bpm",
-        "sample_lyrics": "[Verse 1]\n자정이 넘어선 이 시간\n네온사인 불빛 아래 둘만의 거리\n들려오는 몽환적인 멜로디에\n너의 눈빛이 스며들어 와\n\n[Chorus]\nBaby tell me what you want tonight\n달콤하게 번져가는 이 느낌\n새벽 공기마저 우리 편이 돼\nGroove with me until the morning light\n\n[Bridge]\n말하지 않아도 알 수 있어\n너와 나 사이의 특별한 텐션\n\n[Chorus]\nBaby tell me what you want tonight\n달콤하게 번져가는 이 느낌\n우리만의 은밀한 플레이리스트\nGroove with me until the morning light"
-    },
-    "kpop_rock": {
-        "title": "🎸 K-POP 록 발라드 / 모던 록 (K-Pop Modern Rock Ballad, 80 BPM)",
-        "prompt": "powerful expressive Korean rock vocals, intense K-pop modern rock ballad, overdrive electric guitar riff, heavy energetic live drums, emotional soaring vocal climax, 80 bpm",
-        "sample_lyrics": "[Verse 1]\n무너져 버린 세상 끝에서\n다시 한번 일어서려 해\n비바람이 내 앞을 막아서도\n난 결코 쓰러지지 않아\n\n[Chorus]\n소리쳐 외쳐라 내 영혼의 노래\n어둠을 가르는 전자기타 선율처럼\n심장이 타오르는 순간까지\n나만의 길을 끝까지 달려갈게!\n\n[Outro]\nI will never give up!"
-    },
-    "custom": {
-        "title": "✍️ 사용자 정의 직접 입력 (Custom Style & Prompt)",
-        "prompt": "",
-        "sample_lyrics": ""
-    }
-}
+from ebook_writer import save_ebook_auto_increment, markdown_to_book_html, EbookWriter
+from text_engine import GenerationCancelled, ollama_generate
+from song_studio import SongStudio
 
 def get_python_exe():
     if getattr(sys, "frozen", False):
@@ -411,152 +387,32 @@ class FullEBookWorker(QThread):
     def cancel(self):
         self._is_cancelled = True
 
-    def _call_ollama(self, prompt, max_tokens=8192):
-        if self._is_cancelled:
-            return ""
-        url = f"http://127.0.0.1:{self.port}/api/generate"
-        payload = {
-            "model": self.model,
-            "prompt": prompt,
-            "stream": False,
-            "options": {
-                "num_ctx": 16384,
-                "num_predict": max_tokens,
-                "temperature": 0.7
-            }
-        }
-        req = urllib.request.Request(
-            url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"}
-        )
-        with urllib.request.urlopen(req, timeout=360) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            return data.get("response", "").strip()
-
     def run(self):
         self.start_time = time.time()
-        try:
-            if self.mode == "summary":
-                self._run_single_mode("핵심 요약 개요", 1500)
-            elif self.mode == "chapter":
-                self._run_single_mode("단일 심층 챕터", 5000)
-            else:
-                self._run_full_book()
-        except Exception as e:
-            self.sig_finished.emit(False, "", str(e))
-
-    def _run_single_mode(self, label, target_chars):
-        self.emit_progress(f"{label} 원고 집필 중...", 20, 0, 1, 0)
-        prompt = (
-            f"다음 주제로 전문 전자책 원고({target_chars}자 이상)를 작성하라.\n\n"
-            f"주제: '{self.topic}'\n\n"
-            f"[필수 지침]\n"
-            f"1. 목차와 체계적인 챕터 구조(1. ..., 2. ...)를 포함할 것.\n"
-            f"2. 사실 검증된 구체적 통계와 사례를 담아 {target_chars}자 이상 깊이 있게 서술할 것."
-        )
-        out = self._call_ollama(prompt, max_tokens=6000)
-        if self._is_cancelled:
-            self.sig_finished.emit(False, "", "사용자에 의해 취소되었습니다.")
-            return
-        self.emit_progress(f"{label} 집필 완료!", 100, 1, 1, len(out))
-        self.sig_chapter_done.emit(label, out, out)
-        self.sig_finished.emit(True, out, "")
-
-    def _run_full_book(self):
-        # 1. 기획 및 목차 생성 단계 (Step 0)
-        self.emit_progress("기획 및 7개 챕터 목차 설계 중...", 5, 0, 7, 0)
-        toc_prompt = f"""당신은 출판계 최고의 기획자이자 저술가입니다.
-주제: '{self.topic}'
-
-이 주제로 총 25,000 ~ 30,000자 분량의 정규 단행본 전자책을 출간하려 합니다.
-프롤로그, 제1장~제5장, 에필로그까지 총 7개 챕터로 구성된 상세 목차를 기획하세요.
-반드시 아래 JSON 배열 형식으로만 응답해야 합니다:
-[
-  {{"title": "프롤로그: ...", "summary": "..."}},
-  {{"title": "제1장: ...", "summary": "..."}},
-  {{"title": "제2장: ...", "summary": "..."}},
-  {{"title": "제3장: ...", "summary": "..."}},
-  {{"title": "제4장: ...", "summary": "..."}},
-  {{"title": "제5장: ...", "summary": "..."}},
-  {{"title": "에필로그: ...", "summary": "..."}}
-]"""
-        toc_raw = self._call_ollama(toc_prompt, max_tokens=2048)
-        if self._is_cancelled:
-            self.sig_finished.emit(False, "", "사용자에 의해 취소되었습니다.")
-            return
-
-        chapters = []
-        try:
-            m = re.search(r'\[.*\]', toc_raw, re.DOTALL)
-            if m:
-                chapters = json.loads(m.group(0))
-        except Exception:
-            pass
-
-        if not chapters or len(chapters) < 5:
-            chapters = [
-                {"title": f"프롤로그: 새로운 시대의 개막과 {self.topic}의 태동", "summary": "문제의식 제기, 독자에게 던지는 핵심 화두와 기획 의도"},
-                {"title": f"제1장: {self.topic}의 본질과 핵심 동인", "summary": "개념적 기원, 핵심 기술/사회적 메커니즘, 구조적 작동 원리 심층 분석"},
-                {"title": f"제2장: 산업과 일상의 거대한 지각변동", "summary": "구체적인 글로벌 및 국내 산업별 영향, 직업과 생활의 구체적 변화 사례"},
-                {"title": f"제3장: 현실적 갈등과 숨겨진 위기 요인", "summary": "부작용, 윤리적·경제적 쟁점, 취약 계층의 위기 및 극복 과제"},
-                {"title": f"제4장: 공존을 위한 혁신 전략과 대응 해법", "summary": "선도 기업과 선진국의 대응 전략, 실전 가이드라인 및 정책 제안"},
-                {"title": f"제5장: 10년 후 미래 전망과 차세대 기회", "summary": "향후 메가트렌드 예측, 미래 사회를 선도할 새로운 기회와 역량"},
-                {"title": f"에필로그: 인간다움의 재발견과 내일을 향한 제언", "summary": "기술과 인간 가치의 조화, 미래를 맞이하는 지혜로운 태도와 총평"}
-            ]
-
-        total_steps = len(chapters)
-        full_book_text = f"# {self.topic}\n\n"
-        full_book_text += "## [목차 (Contents)]\n\n"
-        for i, ch in enumerate(chapters):
-            full_book_text += f"{i+1}. {ch.get('title')}\n"
-        full_book_text += "\n---\n\n"
-
         step_times = []
-        for idx, ch in enumerate(chapters):
-            if self._is_cancelled:
-                self.sig_finished.emit(False, full_book_text, "집필이 취소되었습니다. (작성된 챕터까지 보존되었습니다)")
-                return
+        last = {"step": 0, "ts": time.time()}
 
-            ch_title = ch.get("title", f"제{idx+1}장")
-            ch_summary = ch.get("summary", "")
-            
-            # Progress calculation
-            pct = int((idx / total_steps) * 100)
-            self.emit_progress(f"[{idx+1}/{total_steps}] '{ch_title}' 집필 중...", pct, idx, total_steps, len(full_book_text), step_times)
+        def on_progress(msg, cur_step, total_steps, total_chars):
+            if cur_step > last["step"]:
+                step_times.append((time.time() - last["ts"]) / (cur_step - last["step"]))
+                last.update(step=cur_step, ts=time.time())
+            pct = int(cur_step / max(1, total_steps) * 100)
+            self.emit_progress(msg, pct, cur_step, total_steps, total_chars, step_times)
 
-            step_start = time.time()
-            prompt = f"""당신은 '{self.topic}' 분야의 최고 권위자이자 전문 저술가입니다.
-전체 전자책 기획에 맞춰, 아래 챕터의 원고를 최소 4,000자 이상으로 깊이 있고 풍부하게 작성하십시오.
-
-[현재 집필할 챕터]
-제목: {ch_title}
-핵심 요강: {ch_summary}
-
-[전체 주제]
-{self.topic}
-
-[필수 작성 지침]
-1. 실제 통계, 역사적/현대적 사례, 구체적인 예시와 비유를 풍부하게 포함할 것.
-2. 단순 나열을 피하고 기승전결이 있는 서술형 문장으로 깊이 있게 전개할 것.
-3. 세부 소제목(### 1. ..., ### 2. ..., ### 3. ...)을 명확히 나누어 독자가 몰입할 수 있도록 할 것.
-4. 최소 4,000자 이상 충분한 분량의 완성도 높은 원고로 서술할 것.
-5. 책의 한 장이므로 챕터 제목(## {ch_title})으로 시작할 것."""
-
-            ch_content = self._call_ollama(prompt, max_tokens=8192)
-            if self._is_cancelled:
-                self.sig_finished.emit(False, full_book_text, "집필이 취소되었습니다. (작성된 챕터까지 보존되었습니다)")
-                return
-
-            step_duration = time.time() - step_start
-            step_times.append(step_duration)
-
-            full_book_text += f"\n\n## {ch_title}\n\n{ch_content}\n\n---\n"
-            self.sig_chapter_done.emit(ch_title, ch_content, full_book_text)
-
-        # 100% 완료
-        self.emit_progress("전체 전자책 완필 완료!", 100, total_steps, total_steps, len(full_book_text), step_times)
-        self.sig_finished.emit(True, full_book_text, "")
+        writer = EbookWriter(
+            self.topic, model=self.model, port=self.port, mode=self.mode,
+            log=lambda *_: None,
+            on_progress=on_progress,
+            on_chapter=lambda title, ch_md, full: self.sig_chapter_done.emit(title, ch_md, full),
+            cancel_check=lambda: self._is_cancelled,
+        )
+        try:
+            full_text = writer.write()
+            self.sig_finished.emit(True, full_text, "")
+        except GenerationCancelled:
+            self.sig_finished.emit(False, writer.partial_text, "집필이 취소되었습니다. (작성된 부분까지 보존되었습니다)")
+        except Exception as e:
+            self.sig_finished.emit(False, writer.partial_text, str(e))
 
     def emit_progress(self, msg, pct, cur_step, total_steps, total_chars, step_times=None):
         elapsed = time.time() - self.start_time if self.start_time else 0.0
@@ -602,87 +458,11 @@ class TextGenWorker(QThread):
         self.task_kind = task_kind
 
     def run(self):
-        url = f"http://127.0.0.1:{self.port}/api/generate"
         self.progress.emit("Ollama 서버에 텍스트 생성 요청 중...")
-        data = {
-            "model": self.model,
-            "prompt": self.prompt,
-            "stream": False,
-            "options": {"num_ctx": 16384, "temperature": 0.7}
-        }
-        payload = json.dumps(data).encode("utf-8")
-        req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
         try:
-            with urllib.request.urlopen(req, timeout=300) as resp:
-                res = json.loads(resp.read().decode("utf-8"))
-                output_text = res.get("response", "").strip()
-                self.progress.emit(f"텍스트 생성 완료 ({len(output_text):,}자)")
-                self.finished.emit(True, output_text, "")
-        except Exception as e:
-            self.finished.emit(False, "", str(e))
-
-
-class MusicGenWorker(QThread):
-    progress = pyqtSignal(str)
-    finished = pyqtSignal(bool, str, str)
-
-    def __init__(self, port, caption, lyrics, duration=60, ref_audio=None):
-        super().__init__()
-        self.port = port
-        self.caption = caption
-        self.lyrics = lyrics
-        self.duration = duration
-        self.ref_audio = ref_audio
-
-    def run(self):
-        try:
-            # 1. VRAM 자율 중재: Ollama 언로드 및 메모리 확보
-            self.progress.emit("[VRAM 중재자] Ollama LLM 가중치 언로드 중...")
-            subprocess.run(
-                ["ollama", "stop", "qwen3:14b"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                creationflags=CREATE_NO_WINDOW
-            )
-            time.sleep(1.0)
-
-            # 2. VRAM 잔여량 실측
-            vram_used, total_vram = get_gpu_memory()
-            if total_vram > 0 and (total_vram - vram_used) < 6500:
-                raise RuntimeError(
-                    f"가용 VRAM 부족으로 작곡을 시작할 수 없습니다 (가용: {total_vram - vram_used:,} MiB / 최소 필요: 6,500 MiB).\n"
-                    f"다른 프로그램을 종료하여 VRAM을 확보해주세요."
-                )
-            self.progress.emit(f"[VRAM 중재자] VRAM 점유량: {vram_used} MiB (안전 임계치 통과)")
-
-            # 3. 임시 프롬프트 및 가사 파일 저장
-            prompt_file = BATCH_OUT / "vocal_song.prompt.txt"
-            lyrics_file = BATCH_OUT / "vocal_lyrics.txt"
-            prompt_file.write_text(self.caption, encoding="utf-8")
-            lyrics_file.write_text(self.lyrics, encoding="utf-8")
-
-            # 4. 공식 ACE-Step 1.5 24스텝 일체형 보컬 음악 생성 (소음 제거 및 자연스러운 가창 완곡)
-            self.progress.emit(f"[ACE-Step 1.5] 24스텝 고음질 일체형 보컬 음악 생성 중 ({self.duration}초)...")
-            bgm_file = BATCH_OUT / "song-01.mp3"
-            cmd = [
-                get_python_exe(),
-                str(BASE_DIR / "audio_engines" / "acestep_official_runner.py"),
-                "--prompt-file", str(prompt_file),
-                "--lyrics-file", str(lyrics_file),
-                "--output", str(bgm_file),
-                "--duration", str(self.duration),
-                "--steps", "8"
-            ]
-            if self.ref_audio and Path(self.ref_audio).exists():
-                cmd.extend(["--ref-audio", str(self.ref_audio)])
-
-            p = subprocess.run(cmd, capture_output=True, text=True, creationflags=CREATE_NO_WINDOW)
-            if p.returncode != 0:
-                raise RuntimeError(f"ACE-Step 실행 오류: {p.stderr}")
-
-            # 가짜 TTS 낭독 믹싱 및 노이즈 컨볼루션 전면 제거: 일체형 고음질 완곡 바로 채택
-            self.progress.emit(f"고음질 일체형 보컬 음원 완성: {bgm_file.name}")
-            self.finished.emit(True, str(bgm_file), "")
+            output_text = ollama_generate(self.prompt, model=self.model, port=self.port, max_tokens=6000)
+            self.progress.emit(f"텍스트 생성 완료 ({len(output_text):,}자)")
+            self.finished.emit(True, output_text, "")
         except Exception as e:
             self.finished.emit(False, "", str(e))
 
@@ -775,8 +555,13 @@ class VocalTrainingWorker(QThread):
                         pct = int(parts[1])
                         s_title = parts[2]
                         elapsed = int(time.time() - self.start_time)
-                        total_expected = 40.0 if self.preset == "fast" else (65.0 if self.preset == "standard" else 120.0)
-                        rem = max(0, int(total_expected * (1.0 - (pct / 100.0))))
+                        m_eta = re.search(r"남은 시간 약 (\d+)분", s_title)
+                        if m_eta:
+                            rem = int(m_eta.group(1)) * 60
+                        elif pct >= 5:
+                            rem = int(elapsed * (100 - pct) / pct)
+                        else:
+                            rem = 0
                         target_str = time.strftime("%H:%M", time.localtime(time.time() + rem)) if rem > 0 else ""
                         self.sig_progress.emit({
                             "stage_num": s_num,
@@ -797,8 +582,8 @@ class VocalTrainingWorker(QThread):
 
             if self._is_cancelled:
                 self.sig_finished.emit(False, "", "사용자에 의해 학습이 중단되었습니다.")
-            elif success or self.proc.returncode == 0:
-                self.sig_finished.emit(True, self.model_name, f"'{self.model_name}' 보컬 학습이 완벽하게 완료되었습니다!")
+            elif success and self.proc.returncode == 0:
+                self.sig_finished.emit(True, self.model_name, f"'{self.model_name}' LoRA 학습이 완료되었습니다.")
             else:
                 self.sig_finished.emit(False, "", err_msg or f"학습 프로세스 오류 코드 {self.proc.returncode}")
         except Exception as e:
@@ -930,8 +715,8 @@ class YunseulLMMStudio(QWidget):
         self.tabs.addTab(self.tab_merge, "🔄 글 병합 & 재구성")
 
         # 탭 4: 보컬 음악 스튜디오
-        self.tab_music = self.create_music_tab()
-        self.tabs.addTab(self.tab_music, "🎵 보컬 음악 스튜디오")
+        self.tab_music = SongStudio(self, BASE_DIR, BATCH_OUT / "songs", TRAINED_MODELS_DIR, ACESTEP_PY)
+        self.tabs.addTab(self.tab_music, "🎵 노래 만들기")
 
         # 탭 5: 보컬 학습 스튜디오
         self.tab_train = self.create_train_tab()
@@ -1323,156 +1108,6 @@ class YunseulLMMStudio(QWidget):
     # -------------------------------------------------------------------------
     # Tab 4: Music & Vocal Studio
     # -------------------------------------------------------------------------
-    def create_music_tab(self):
-        w = QWidget()
-        layout = QVBoxLayout(w)
-        layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(12)
-
-        # 0. 보컬 음색 모델 선택 바
-        model_bar = QHBoxLayout()
-        lbl_vmodel = QLabel("🎤 가창 보컬 모델:")
-        lbl_vmodel.setStyleSheet("font-weight: bold; color: #38bdf8; font-size: 13px;")
-        model_bar.addWidget(lbl_vmodel)
-
-        self.combo_vocal_model = QComboBox()
-        self.combo_vocal_model.setStyleSheet("""
-            QComboBox {
-                background-color: #1e293b; color: white; border: 1px solid #334155;
-                border-radius: 6px; padding: 6px 12px; font-size: 12px; min-width: 280px;
-            }
-            QComboBox QAbstractItemView {
-                background-color: #0f172a; color: white; selection-background-color: #0284c7;
-            }
-        """)
-        model_bar.addWidget(self.combo_vocal_model)
-
-        btn_refresh_vocal = QPushButton("🔄 모델 새로고침")
-        btn_refresh_vocal.setStyleSheet("background-color: #1e293b; color: #cbd5e1; border: 1px solid #334155; border-radius: 6px; padding: 6px 12px;")
-        btn_refresh_vocal.clicked.connect(self.refresh_vocal_models)
-        model_bar.addWidget(btn_refresh_vocal)
-
-        btn_go_train = QPushButton("🎤 새 보컬 학습하러 가기")
-        btn_go_train.setStyleSheet("background-color: #0284c7; color: white; font-weight: bold; border-radius: 6px; padding: 6px 14px;")
-        btn_go_train.clicked.connect(lambda: self.tabs.setCurrentWidget(self.tab_train))
-        model_bar.addWidget(btn_go_train)
-        model_bar.addStretch()
-        layout.addLayout(model_bar)
-
-        # 1. 장르/스타일 선택 바 (발라드 vs K-POP 전용 선택)
-        genre_bar = QHBoxLayout()
-        lbl_genre = QLabel("🎼 작곡 장르/스타일:")
-        lbl_genre.setStyleSheet("font-weight: bold; color: #a855f7; font-size: 13px;")
-        genre_bar.addWidget(lbl_genre)
-
-        self.combo_music_genre = QComboBox()
-        for k, v in MUSIC_GENRE_PRESETS.items():
-            self.combo_music_genre.addItem(v["title"], k)
-        self.combo_music_genre.setStyleSheet("""
-            QComboBox {
-                background-color: #1e293b; color: white; border: 1px solid #334155;
-                border-radius: 6px; padding: 6px 12px; font-size: 12px; font-weight: bold; min-width: 330px;
-            }
-            QComboBox QAbstractItemView {
-                background-color: #0f172a; color: white; selection-background-color: #a855f7;
-            }
-        """)
-        self.combo_music_genre.currentIndexChanged.connect(self.on_music_genre_changed)
-        genre_bar.addWidget(self.combo_music_genre)
-
-        btn_sample_lyrics = QPushButton("📝 장르별 맞춤 가사 채우기")
-        btn_sample_lyrics.setStyleSheet("background-color: #334155; color: #38bdf8; font-weight: bold; border-radius: 6px; padding: 6px 12px;")
-        btn_sample_lyrics.clicked.connect(self.apply_genre_recommended_lyrics)
-        genre_bar.addWidget(btn_sample_lyrics)
-
-        genre_bar.addStretch()
-        layout.addLayout(genre_bar)
-
-        # 2. 세부 프롬프트 & 가사 & 작곡 시작 바
-        top_ctrl = QHBoxLayout()
-        top_ctrl.addWidget(QLabel("스타일 프롬프트:"))
-        self.edit_style = QLineEdit(MUSIC_GENRE_PRESETS["ballad_acoustic"]["prompt"])
-        self.edit_style.setStyleSheet("background-color: #1e293b; color: white; border: 1px solid #334155; border-radius: 6px; padding: 6px 10px;")
-        top_ctrl.addWidget(self.edit_style)
-
-        btn_load_lyrics = QPushButton("가사 불러오기")
-        btn_load_lyrics.setStyleSheet("background-color: #1e293b; color: #38bdf8; border: 1px solid #334155; border-radius: 6px; padding: 6px 12px;")
-        btn_load_lyrics.clicked.connect(self.load_lyrics_from_disk)
-        top_ctrl.addWidget(btn_load_lyrics)
-
-        self.btn_gen_music = QPushButton("🎵 보컬 음악 작곡 시작")
-        self.btn_gen_music.setStyleSheet("background-color: #ec4899; color: white; font-weight: bold; border-radius: 6px; padding: 6px 16px;")
-        self.btn_gen_music.clicked.connect(self.start_music_generation)
-        top_ctrl.addWidget(self.btn_gen_music)
-        layout.addLayout(top_ctrl)
-
-        # 3. 가사 입력창
-        layout.addWidget(QLabel("노래 가사 (Section 구조):"))
-        self.txt_lyrics = QTextEdit()
-        self.txt_lyrics.setFixedHeight(160)
-        self.txt_lyrics.setStyleSheet("background-color: #0f172a; color: #f1f5f9; border: 1px solid #1e293b; border-radius: 8px; padding: 10px; font-size: 13px;")
-        existing_lyrics = BATCH_OUT / "vocal_lyrics.txt"
-        if existing_lyrics.exists() and existing_lyrics.read_text(encoding="utf-8").strip():
-            self.txt_lyrics.setPlainText(existing_lyrics.read_text(encoding="utf-8"))
-        else:
-            self.txt_lyrics.setPlainText(MUSIC_GENRE_PRESETS["ballad_acoustic"]["sample_lyrics"])
-        layout.addWidget(self.txt_lyrics)
-
-        # 3. 내장 오디오 플레이어 카드
-        player_card = QFrame()
-        player_card.setStyleSheet("background-color: #0f172a; border: 1px solid #1e293b; border-radius: 12px;")
-        p_layout = QVBoxLayout(player_card)
-        p_layout.setContentsMargins(16, 12, 16, 12)
-        p_layout.setSpacing(8)
-
-        p_info = QHBoxLayout()
-        self.lbl_now_playing = QLabel("재생 대기: batch_out/song-01.mp3")
-        self.lbl_now_playing.setStyleSheet("color: #f8fafc; font-weight: bold; font-size: 13px;")
-        p_info.addWidget(self.lbl_now_playing)
-        p_info.addStretch()
-
-        self.lbl_time = QLabel("0:00 / 1:00")
-        self.lbl_time.setStyleSheet("color: #94a3b8; font-size: 12px;")
-        p_info.addWidget(self.lbl_time)
-        p_layout.addLayout(p_info)
-
-        # 시크 바
-        self.slider_seek = QSlider(Qt.Orientation.Horizontal)
-        self.slider_seek.setStyleSheet("QSlider::groove:horizontal { height: 4px; background: #1e293b; } QSlider::handle:horizontal { background: #38bdf8; width: 12px; margin: -4px 0; border-radius: 6px; }")
-        self.slider_seek.sliderMoved.connect(self.set_player_position)
-        p_layout.addWidget(self.slider_seek)
-
-        # 플레이어 버튼들
-        ctl_bar = QHBoxLayout()
-        self.btn_play_pause = QPushButton("▶ 재생")
-        self.btn_play_pause.setFixedSize(80, 32)
-        self.btn_play_pause.setStyleSheet("background-color: #0284c7; color: white; font-weight: bold; border-radius: 6px;")
-        self.btn_play_pause.clicked.connect(self.toggle_play_pause)
-        ctl_bar.addWidget(self.btn_play_pause)
-
-        btn_open_folder = QPushButton("📁 음원 폴더 열기")
-        btn_open_folder.setStyleSheet("background-color: #1e293b; color: white; border: 1px solid #475569; border-radius: 6px; padding: 5px 12px;")
-        btn_open_folder.clicked.connect(lambda: os.startfile(str(BATCH_OUT)))
-        ctl_bar.addWidget(btn_open_folder)
-
-        ctl_bar.addStretch()
-        ctl_bar.addWidget(QLabel("볼륨:"))
-        self.slider_vol = QSlider(Qt.Orientation.Horizontal)
-        self.slider_vol.setFixedWidth(100)
-        self.slider_vol.setRange(0, 100)
-        self.slider_vol.setValue(85)
-        self.slider_vol.valueChanged.connect(lambda v: self.audio_output.setVolume(v / 100.0))
-        ctl_bar.addWidget(self.slider_vol)
-        p_layout.addLayout(ctl_bar)
-
-        layout.addWidget(player_card)
-
-        # 플레이어 시그널 연결
-        self.player.positionChanged.connect(self.on_player_position_changed)
-        self.player.durationChanged.connect(self.on_player_duration_changed)
-
-        return w
-
     # -------------------------------------------------------------------------
     # Tab 5: Vocal Training Studio (보컬 AI 학습 스튜디오)
     # -------------------------------------------------------------------------
@@ -1558,9 +1193,12 @@ class YunseulLMMStudio(QWidget):
         form_preset = QHBoxLayout()
         form_preset.addWidget(QLabel("학습 모드:"))
         self.combo_train_preset = QComboBox()
-        self.combo_train_preset.addItem("표준 정밀 (Standard, 15 Epochs - 권장)", "standard")
-        self.combo_train_preset.addItem("빠른 프리뷰 (Fast, 10 Epochs)", "fast")
-        self.combo_train_preset.addItem("심층 고품질 (Deep, 25 Epochs)", "deep")
+        self.combo_train_preset.addItem("표준 (Standard - 권장, 곡 수에 맞춰 epoch 자동)", "standard")
+        self.combo_train_preset.addItem("빠른 시험 (Fast, 표준의 절반)", "fast")
+        self.combo_train_preset.addItem("심층 (Deep, 표준의 1.6배 · 오래 걸림)", "deep")
+        self.combo_train_preset.setToolTip(
+            "ACE-Step 공식 가이드 기준: 1~10곡 200~500 epoch, 10~50곡 100~200, 50곡 이상 50~100.\n"
+            "음원 옆에 같은 이름의 .txt/.lrc 가사 파일이 있으면 받아쓰기 대신 그 가사를 씁니다.")
         self.combo_train_preset.setStyleSheet("""
             QComboBox {
                 background-color: #1e293b; color: white; border: 1px solid #334155;
@@ -1939,10 +1577,10 @@ class YunseulLMMStudio(QWidget):
 
             used_mb, total_mb = get_gpu_memory()
             free_mb = total_mb - used_mb
-            req_mb = 7000
+            req_mb = 7000 if task_type == "music" else 10000
 
             task_name = "보컬 음악 작곡" if task_type == "music" else "보컬 모델 학습"
-            engine_name = "ACE-Step 1.5 일체형 오디오 엔진" if task_type == "music" else "보컬 음색 학습 엔진"
+            engine_name = "ACE-Step 1.5 일체형 오디오 엔진" if task_type == "music" else "ACE-Step LoRA 학습 엔진"
 
             if free_mb < req_mb:
                 deficit = req_mb - free_mb
@@ -2260,131 +1898,8 @@ class YunseulLMMStudio(QWidget):
     # Actions: Music & Audio Player
     # -------------------------------------------------------------------------
     def refresh_vocal_models(self):
-        if not hasattr(self, "combo_vocal_model"):
-            return
-        curr = self.combo_vocal_model.currentText()
-        self.combo_vocal_model.clear()
-        self.combo_vocal_model.addItem("기본 보컬 (ACE-Step Foundation Default)", None)
-
-        if TRAINED_MODELS_DIR.exists():
-            for mdir in sorted(TRAINED_MODELS_DIR.iterdir()):
-                if mdir.is_dir():
-                    meta_path = mdir / "meta.json"
-                    ref_audio = mdir / "ref_vocal.wav"
-                    display_name = f"🎤 {mdir.name}"
-                    if meta_path.exists():
-                        try:
-                            meta = json.loads(meta_path.read_text(encoding="utf-8"))
-                            epochs = meta.get("epochs", 15)
-                            samples = meta.get("samples_count", 0)
-                            display_name = f"🌟 {mdir.name} ({epochs}ep / {samples}조각)"
-                            if "ref_audio" in meta and Path(meta["ref_audio"]).exists():
-                                ref_audio = Path(meta["ref_audio"])
-                        except Exception:
-                            pass
-                    if ref_audio.exists():
-                        self.combo_vocal_model.addItem(display_name, str(ref_audio))
-
-        # 이전 선택 복원
-        for i in range(self.combo_vocal_model.count()):
-            if self.combo_vocal_model.itemText(i) == curr:
-                self.combo_vocal_model.setCurrentIndex(i)
-                break
-
-    def on_music_genre_changed(self, idx):
-        genre_key = self.combo_music_genre.currentData()
-        if genre_key in MUSIC_GENRE_PRESETS and genre_key != "custom":
-            self.edit_style.setText(MUSIC_GENRE_PRESETS[genre_key]["prompt"])
-
-    def apply_genre_recommended_lyrics(self):
-        genre_key = self.combo_music_genre.currentData()
-        if genre_key in MUSIC_GENRE_PRESETS:
-            preset = MUSIC_GENRE_PRESETS[genre_key]
-            sample = preset.get("sample_lyrics", "").strip()
-            if sample:
-                self.txt_lyrics.setPlainText(sample)
-                QMessageBox.information(
-                    self,
-                    "맞춤 가사 적용",
-                    f"'{preset['title'].split('(')[0].strip()}'에 최적화된 Verse-Chorus 구조 가사가 입력창에 적용되었습니다."
-                )
-
-    def load_lyrics_from_disk(self):
-        candidates = [BATCH_OUT / "vocal_lyrics.txt", BATCH_OUT / "lyrics-01.txt"]
-        for c in candidates:
-            if c.exists():
-                self.txt_lyrics.setPlainText(c.read_text(encoding="utf-8"))
-                QMessageBox.information(self, "가사 로드", f"{c.name}에서 가사를 불러왔습니다.")
-                return
-
-    def start_music_generation(self):
-        caption = self.edit_style.text().strip()
-        lyrics = self.txt_lyrics.toPlainText().strip()
-        if not lyrics:
-            QMessageBox.warning(self, "가사 필요", "노래할 가사를 입력해주세요.")
-            return
-
-        # VRAM 잔여량 점검 (부족 시 경고 팝업 및 시작 차단)
-        ok, vram_msg = self.check_vram_for_task("music")
-        if not ok:
-            QMessageBox.warning(self, "VRAM 부족 - 작곡 불가", vram_msg)
-            return
-
-        ref_audio = self.combo_vocal_model.currentData() if hasattr(self, "combo_vocal_model") else None
-        genre_title = self.combo_music_genre.currentText().split("(")[0].strip() if hasattr(self, "combo_music_genre") else "보컬 음악"
-
-        self.btn_gen_music.setEnabled(False)
-        self.btn_gen_music.setText(f"⏳ [{genre_title}] 작곡 & 보컬 믹싱 중...")
-
-        self.music_worker = MusicGenWorker(
-            self.port,
-            caption,
-            lyrics,
-            duration=self.cfg.get("default_duration_sec", 60),
-            ref_audio=ref_audio
-        )
-        self.music_worker.progress.connect(lambda msg: self.btn_gen_music.setText(f"⏳ {msg}"))
-        self.music_worker.finished.connect(self.on_music_finished)
-        self.music_worker.start()
-
-    def on_music_finished(self, ok, path, err):
-        self.btn_gen_music.setEnabled(True)
-        self.btn_gen_music.setText("🎵 보컬 음악 작곡 시작")
-        if ok:
-            self.lbl_now_playing.setText(f"재생 대기: {Path(path).name}")
-            self.player.setSource(QUrl.fromLocalFile(path))
-            QMessageBox.information(self, "작곡 완료", "공식 ACE-Step 1.5 보컬 음원이 완성되었습니다! 아래 플레이어에서 들어보세요.")
-        else:
-            QMessageBox.critical(self, "작곡 오류", f"음악 생성 실패: {err}")
-
-    def toggle_play_pause(self):
-        song_path = BATCH_OUT / "song-01.mp3"
-        if not song_path.exists():
-            QMessageBox.warning(self, "파일 없음", "먼저 음악을 생성해주세요.")
-            return
-
-        if self.player.source().isEmpty():
-            self.player.setSource(QUrl.fromLocalFile(str(song_path)))
-
-        if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
-            self.player.pause()
-            self.btn_play_pause.setText("▶ 재생")
-        else:
-            self.player.play()
-            self.btn_play_pause.setText("⏸ 일시정지")
-
-    def on_player_position_changed(self, pos):
-        if not self.slider_seek.isSliderDown():
-            self.slider_seek.setValue(pos)
-        dur = self.player.duration()
-        pos_s, dur_s = pos // 1000, dur // 1000
-        self.lbl_time.setText(f"{pos_s//60}:{pos_s%60:02d} / {dur_s//60}:{dur_s%60:02d}")
-
-    def on_player_duration_changed(self, dur):
-        self.slider_seek.setRange(0, dur)
-
-    def set_player_position(self, pos):
-        self.player.setPosition(pos)
+        if hasattr(self, "tab_music"):
+            self.tab_music.refresh_voices()
 
     # -------------------------------------------------------------------------
     # Actions: Vocal AI Training Studio (5단계 올인원 학습 제어)
@@ -2543,24 +2058,33 @@ class YunseulLMMStudio(QWidget):
 
         if ok:
             self.pbar_train.setValue(100)
-            self.lbl_train_stage_status.setText(f"🎉 5단계 학습 완벽 완료! ({model_name} / 소요: {elapsed_str})")
+            self.lbl_train_stage_status.setText(f"🎉 LoRA 학습 완료 ({model_name} / 소요: {elapsed_str})")
             self.lbl_train_time_info.setText(f"⏱️ 총 소요: {elapsed_str} | ✅ 모델 등록 완료")
             self.refresh_vocal_models()
+            info = ""
+            try:
+                meta = json.loads((TRAINED_MODELS_DIR / model_name / "meta.json").read_text(encoding="utf-8"))
+                info = (f"• 학습 곡 수: {meta.get('songs_count')}곡 (가사 포함 {meta.get('songs_with_lyrics')}곡)\n"
+                        f"• {meta.get('epochs')} epoch / 최종 loss {meta.get('final_loss')}\n"
+                        f"• 노래 생성 시 트리거 태그 '{meta.get('trigger_tag')}' 가 캡션 앞에 자동으로 붙습니다.\n")
+            except Exception:
+                pass
             reply = QMessageBox.information(
                 self,
                 "보컬 학습 완료",
-                f"축하합니다! '{model_name}' 보컬의 5단계 올인원 학습이 완료되었습니다.\n\n"
+                f"'{model_name}' 보컬/스타일 LoRA 학습이 완료되었습니다.\n\n"
                 f"• 총 소요 시간: {elapsed_str}\n"
-                f"• 저장 폴더: trained_vocal_models/{model_name}\n"
-                f"• 반주 분리, 슬라이싱, 라벨링, 신경망 학습 가중치 저장 및 자동 등록이 완료되었습니다.\n\n"
-                f"지금 [보컬 음악 스튜디오]로 이동하여 이 보컬 목소리로 노래를 만들어 보시겠습니까?",
+                f"• 저장 폴더: trained_vocal_models/{model_name}/lora/final\n"
+                f"{info}\n"
+                f"지금 [보컬 음악 스튜디오]로 이동하여 이 보컬로 노래를 만들어 보시겠습니까?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
             )
             if reply == QMessageBox.StandardButton.Yes:
                 self.tabs.setCurrentWidget(self.tab_music)
-                for i in range(self.combo_vocal_model.count()):
-                    if model_name in self.combo_vocal_model.itemText(i):
-                        self.combo_vocal_model.setCurrentIndex(i)
+                combo = self.tab_music.combo_voice
+                for i in range(combo.count()):
+                    if model_name in combo.itemText(i):
+                        combo.setCurrentIndex(i)
                         break
         else:
             self.lbl_train_stage_status.setText("⚠️ 학습이 중단되었습니다.")

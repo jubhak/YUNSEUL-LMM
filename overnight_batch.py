@@ -42,6 +42,9 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from text_engine import RepetitionGuard, strip_thinking  # noqa: E402
+
 # Windows 콘솔 utf-8 설정
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -294,10 +297,10 @@ def polish_ebook_text(job, text: str, cfg, log, dry_run: bool = False) -> str:
         "개선점을 우선순위별로 최대 7개, 각 항목에 구체적 수정 지시를 포함해 요약하십시오.\n\n"
         "[원고]\n" + text
     )
-    resp = api_post("/api/generate", {"model": model, "prompt": critique_prompt, "stream": False,
+    resp = api_post("/api/generate", {"model": model, "prompt": critique_prompt, "stream": False, "think": False,
                                       "options": {"num_ctx": 16384, "temperature": 0.3}},
                     timeout=int(job.get("timeout_sec", 3600)), dry_run=dry_run)
-    critique = (resp or {}).get("response", "").strip()
+    critique = strip_thinking((resp or {}).get("response", "")).strip()
     if not critique:
         log("WARN", f"{job['id']}: 비평 생성 실패 — 원본 유지")
         return text
@@ -312,10 +315,11 @@ def polish_ebook_text(job, text: str, cfg, log, dry_run: bool = False) -> str:
         "4. 수정된 원고 본문만 출력하고 부연 설명을 덧붙이지 말 것\n\n"
         f"[편집자 비평]\n{critique}\n\n[원고]\n{text}"
     )
-    resp = api_post("/api/generate", {"model": model, "prompt": revise_prompt, "stream": False,
-                                      "options": {"num_ctx": 16384, "temperature": 0.5}},
+    resp = api_post("/api/generate", {"model": model, "prompt": revise_prompt, "stream": False, "think": False,
+                                      "options": {"num_ctx": 16384, "temperature": 0.5,
+                                                  "repeat_penalty": 1.12, "presence_penalty": 0.4}},
                     timeout=int(job.get("timeout_sec", 3600)), dry_run=dry_run)
-    revised = (resp or {}).get("response", "").strip()
+    revised = strip_thinking((resp or {}).get("response", "")).strip()
     if not revised:
         log("WARN", f"{job['id']}: 재작성 실패 — 원본 유지")
         return text
@@ -333,7 +337,7 @@ def polish_ebook_text(job, text: str, cfg, log, dry_run: bool = False) -> str:
     return revised
 
 
-def run_text_job(job, cfg, log, dry_run: bool = False) -> None:
+def validate_text_output(job, text: str, out: Path) -> None:
     jid = job.get("id", "")
     stripped = text.strip()
     if not stripped:
@@ -411,13 +415,24 @@ def run_text_job(job, cfg, log, dry_run: bool = False) -> None:
     workdir = Path(cfg["workdir"])
     model = job.get("model") or cfg["text_model"]
     log("INFO", f"{job['id']}: ollama/{model} 호출")
-    resp = api_post(
-        "/api/generate",
-        {"model": model, "prompt": job["prompt"], "stream": False},
-        timeout=int(job.get("timeout_sec", 3600)),
-        dry_run=dry_run,
-    )
-    text = (resp or {}).get("response", "")
+    if job.get("lyrics_topic") and not dry_run:
+        from urllib.parse import urlparse
+        from lyrics_writer import generate_lyrics
+        text = generate_lyrics(
+            job["lyrics_topic"], job.get("genre", "ballad_acoustic"),
+            duration=int(job.get("song_duration", 120)), model=model,
+            port=int(urlparse(OLLAMA_HOST).port or 11434),
+            log=lambda m: log("INFO", f"{job['id']}: {m}"),
+        )
+    else:
+        resp = api_post(
+            "/api/generate",
+            {"model": model, "prompt": job["prompt"], "stream": False, "think": False,
+             "options": {"num_ctx": 16384, "repeat_penalty": 1.12, "presence_penalty": 0.4}},
+            timeout=int(job.get("timeout_sec", 3600)),
+            dry_run=dry_run,
+        )
+        text = strip_thinking((resp or {}).get("response", ""))
     if dry_run:
         text = f"[dry-run] {job['id']} 결과 본문\n# 목차\n## 1장\n## 2장\n[Verse 1]\n노래\n[Chorus]\n후렴\n출처: 테스트\n" + "글" * 3000
     if not text.strip():
@@ -431,6 +446,12 @@ def run_text_job(job, cfg, log, dry_run: bool = False) -> None:
             text = polish_ebook_text(job, text, cfg, log)
         except Exception as e:  # noqa: BLE001
             log("WARN", f"{job['id']}: 다듬기 중 오류 — 원본 유지: {e}")
+
+    if not dry_run and ("ebook" in job.get("id", "") or "원고" in job.get("prompt", "")
+                        or "rewrite" in job.get("id", "")):
+        text, n_dup = RepetitionGuard().dedupe_document(text)
+        if n_dup:
+            log("INFO", f"{job['id']}: 중복 문장 {n_dup}개 제거")
 
     out = workdir / job["out"]
     out.parent.mkdir(parents=True, exist_ok=True)

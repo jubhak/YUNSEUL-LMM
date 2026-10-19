@@ -1,46 +1,55 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-vocal_trainer_runner.py - 5단계 올인원 보컬 AI 자동 학습 백엔드 러너 (대량 순차 처리 & 자원 50% 상한제 & 중복 PASS)
-Stage 1: AI 보컬/반주 분리 (Vocal Separation - Sequential)
-Stage 2: 묵음 및 호흡 감지 프레이즈 슬라이싱 (Audio Slicing - Sequential)
-Stage 3: ASR 한국어 가창 음소 라벨링 & 데이터셋 정렬 (Dataset Alignment)
-Stage 4: RTX 5070 Ti 신경망 가창 모델 파인튜닝 (Neural Model Fine-Tuning)
-Stage 5: 가창 음원 모델 등록 및 메타데이터 동기화 (Model Registration)
+vocal_trainer_runner.py - ACE-Step 1.5 보컬/스타일 LoRA 실제 학습 파이프라인
+Stage 1: 장르 선별 + 중복 검사 (이미 분석한 곡은 캐시 재사용)
+Stage 2: 곡별 학습 라벨 생성 - 가사(옆 가사 파일 우선, 없으면 Whisper 받아쓰기), BPM/키, 캡션
+Stage 3: ACE-Step 전처리 (VAE 잠재 표현 + 가사/캡션 임베딩)
+Stage 4: turbo DiT 에 LoRA 학습 (venv_acestep 의 Side-Step 트레이너)
+Stage 5: 모델 등록 (meta.json 에 adapter_path / trigger_tag 기록 -> 노래 생성 시 자동 적용)
+
+원곡 전체를 가사와 함께 학습해야 ACE-Step 이 '이 가수의 음색/창법'을 가사 정렬과 함께 배운다.
+(이전 버전은 HPSS 분리 + 슬라이스만 만들고 실제 학습 없이 ref_vocal.wav 만 남겨, 생성에 반영되지 않았다.)
 """
 
 import sys
 import os
 
-# 1. 컴퓨터 자원 50% 상한 제한: CPU 스레드 및 메모리 할당 제한
 sys.dont_write_bytecode = True
 os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
-os.environ["OMP_NUM_THREADS"] = "2"
-os.environ["MKL_NUM_THREADS"] = "2"
-os.environ["OPENBLAS_NUM_THREADS"] = "2"
-os.environ["VECLIB_MAXIMUM_THREADS"] = "2"
-os.environ["NUMEXPR_NUM_THREADS"] = "2"
+os.environ.setdefault("OMP_NUM_THREADS", "4")
+os.environ.setdefault("MKL_NUM_THREADS", "4")
 
 import json
 import time
 import re
-import shutil
 import hashlib
 import gc
 import argparse
+import subprocess
+import shutil
 from pathlib import Path
 
-# 콘솔 UTF-8 출력 보장
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
+BASE_DIR = Path(__file__).resolve().parent
+VENV_PY = BASE_DIR / "audio_engines" / "venv_acestep" / "Scripts" / "python.exe"
+TRAINER = BASE_DIR / "audio_engines" / "acestep_lora_trainer.py"
+
+MAX_TRAIN_SEC = 150.0      # 16GB VRAM 에서 안정적인 곡당 학습 길이 (앞부분 150초 = 1절 + 후렴 포함)
+WHISPER_MODEL = "large-v3-turbo"
+
+
 def log(msg):
     print(f"[LOG] {msg}", flush=True)
 
+
 def progress(stage_num, percent, title):
-    print(f"[PROGRESS:{stage_num}:{percent}:{title}]", flush=True)
+    print(f"[PROGRESS:{stage_num}:{int(percent)}:{title}]", flush=True)
+
 
 def get_gpu_vram():
     try:
@@ -51,6 +60,7 @@ def get_gpu_vram():
         return int(info.used // (1024 * 1024)), int(info.total // (1024 * 1024))
     except Exception:
         return 0, 0
+
 
 def get_audio_signature(path: Path) -> str:
     """음원 파일 크기 + 헤더/푸터 해시로 고유 디지털 지문 생성 (빠르고 정확한 중복 판별)"""
@@ -67,6 +77,7 @@ def get_audio_signature(path: Path) -> str:
     except Exception:
         return f"{path.name}_{path.stat().st_size}"
 
+
 def fix_long_path(p: str) -> str:
     """Windows MAX_PATH(260자) 제한 해제를 위한 Extended Path 접두어 자동 처리"""
     try:
@@ -77,6 +88,7 @@ def fix_long_path(p: str) -> str:
     except Exception:
         return p
 
+
 def classify_audio_genre(path: Path) -> tuple:
     """
     3중 하이브리드 K-pop & 발라드 장르 분류기
@@ -84,7 +96,6 @@ def classify_audio_genre(path: Path) -> tuple:
     """
     name_and_path = str(path).lower()
 
-    # 1. 제외 블랙리스트 키워드 검사 (트로트, 랩, 메탈, 연주곡, 클래식 등)
     EXCLUDE_KEYWORDS = [
         "trot", "트로트", "뽕짝", "hiphop", "hip-hop", "힙합", "rap", "랩",
         "metal", "메탈", "death metal", "heavy metal", "hard rock",
@@ -96,7 +107,6 @@ def classify_audio_genre(path: Path) -> tuple:
         if kw in name_and_path:
             return False, f"비대상 장르 키워드 감지 ('{kw}')", kw
 
-    # 2. 메타데이터 (ID3 / Vorbis) 태그 검사
     try:
         import mutagen
         audio = mutagen.File(str(path))
@@ -117,7 +127,6 @@ def classify_audio_genre(path: Path) -> tuple:
     except Exception:
         pass
 
-    # 3. 파일명 타깃 키워드 검사
     TARGET_NAME_KEYWORDS = [
         "ballad", "발라드", "kpop", "k-pop", "dance", "댄스", "pop", "팝",
         "r&b", "rnb", "알앤비", "가요", "아이돌", "ost", "acoustic", "어쿠스틱"
@@ -126,7 +135,6 @@ def classify_audio_genre(path: Path) -> tuple:
         if kw in name_and_path:
             return True, f"파일명 타깃 키워드 일치 ('{kw}')", "K-pop/발라드"
 
-    # 4. 5초 초고속 음향 특성 검사 (Acoustic Probe)
     try:
         import librosa
         import numpy as np
@@ -154,240 +162,467 @@ def classify_audio_genre(path: Path) -> tuple:
 
     return True, "기본 K-pop/발라드 대역 통과", "K-pop/발라드"
 
+
+# =============================================================================
+# 곡 분석: 가사 / BPM / 키 / 캡션
+# =============================================================================
+_LRC_TS = re.compile(r"\[\d{1,2}:\d{2}(?:[.:]\d{1,3})?\]")
+_LRC_META = re.compile(r"^\[(ar|ti|al|by|offset|length|re|ve):", re.I)
+_TAG_LINE = re.compile(r"^\s*\[[^\]]+\]\s*$")
+_HALLUCINATIONS = [
+    "시청해 주셔서", "시청해주셔서", "구독과 좋아요", "구독 좋아요", "좋아요와 구독", "자막 제공",
+    "자막 by", "mbc 뉴스", "kbs 뉴스", "sbs 뉴스", "다음 영상에서", "감사합니다.",
+    "thank you for watching", "subscribe",
+]
+
+
+def find_sidecar_lyrics(af: Path):
+    """음원 옆의 가사 파일(.lyrics.txt / .txt / .lrc) 을 찾아 ACE-Step 가사 형식으로 정리."""
+    stem = af.with_suffix("")
+    for cand in (Path(str(stem) + ".lyrics.txt"), af.with_suffix(".txt"), af.with_suffix(".lrc")):
+        if not cand.exists():
+            continue
+        try:
+            raw = cand.read_text(encoding="utf-8-sig", errors="ignore")
+        except Exception:
+            continue
+        lines = []
+        for ln in raw.splitlines():
+            if _LRC_META.match(ln.strip()):
+                continue
+            ln = _LRC_TS.sub("", ln).strip()
+            lines.append(ln)
+        text = "\n".join(lines).strip()
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        if len(re.sub(r"\s", "", text)) < 20:
+            continue
+        if not any(_TAG_LINE.match(l) for l in text.splitlines()):
+            blocks = [b for b in re.split(r"\n\s*\n", text) if b.strip()]
+            text = _label_blocks([[l for l in b.splitlines() if l.strip()] for b in blocks])
+        return text, cand.name
+    return None, None
+
+
+def _bigrams(text):
+    t = re.sub(r"\s", "", text)
+    return {t[i:i + 2] for i in range(len(t) - 1)}
+
+
+def _label_blocks(blocks):
+    """반복되는 블록은 [Chorus], 나머지는 [Verse N] 으로 구조 태그를 붙인다."""
+    grams = [_bigrams(" ".join(b)) for b in blocks]
+    is_chorus = []
+    for i, g in enumerate(grams):
+        rep = False
+        for j, h in enumerate(grams):
+            if i != j and g and h and len(g & h) / max(1, len(g | h)) >= 0.45:
+                rep = True
+                break
+        is_chorus.append(rep)
+    out, verse_no = [], 0
+    for b, ch in zip(blocks, is_chorus):
+        if ch:
+            tag = "[Chorus]"
+        else:
+            verse_no += 1
+            tag = f"[Verse {verse_no}]"
+        out.append(tag + "\n" + "\n".join(b))
+    return "\n\n".join(out)
+
+
+class Transcriber:
+    """faster-whisper 한국어 가창 받아쓰기 (GPU float16, 실패 시 CPU int8)."""
+
+    def __init__(self):
+        self.model = None
+        self.failed = False
+
+    def _load(self):
+        if self.model is not None or self.failed:
+            return
+        try:
+            import torch
+            torch_lib = Path(torch.__file__).parent / "lib"
+            if torch_lib.exists() and hasattr(os, "add_dll_directory"):
+                os.add_dll_directory(str(torch_lib))
+        except Exception:
+            pass
+        from faster_whisper import WhisperModel
+        try:
+            self.model = WhisperModel(WHISPER_MODEL, device="cuda", compute_type="float16")
+            log(f"  • 가사 받아쓰기 엔진: Whisper {WHISPER_MODEL} (GPU)")
+        except Exception as e:
+            log(f"  ⚠️ Whisper GPU 로드 실패 ({type(e).__name__}) → CPU 모드로 전환 (느림)")
+            try:
+                self.model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8", cpu_threads=8)
+            except Exception as e2:
+                log(f"  ❌ Whisper 로드 실패: {e2} — 가사 없이 스타일만 학습합니다.")
+                self.failed = True
+
+    def transcribe(self, path: Path, max_sec: float):
+        self._load()
+        if self.model is None:
+            return None
+        segments, _info = self.model.transcribe(
+            str(path), language="ko", beam_size=5, vad_filter=False,
+            condition_on_previous_text=False, no_speech_threshold=0.6,
+            compression_ratio_threshold=2.2, temperature=[0.0, 0.2, 0.4],
+        )
+        segs = []
+        for s in segments:
+            if s.start > max_sec:
+                break
+            text = re.sub(r"[\"“”♪~]+", "", s.text).strip()
+            if not text or any(h in text.lower() for h in _HALLUCINATIONS):
+                continue
+            if segs and text == segs[-1][2]:
+                continue
+            segs.append((s.start, s.end, text))
+        return segs
+
+    def unload(self):
+        self.model = None
+        gc.collect()
+        try:
+            import torch
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+
+def structure_transcript(segs):
+    """받아쓰기 구간을 3초 이상 쉼 기준으로 블록화하고 구조 태그를 붙인다."""
+    if not segs:
+        return ""
+    blocks, cur, last_end = [], [], None
+    for st, en, text in segs:
+        if cur and (st - last_end >= 3.0 or len(cur) >= 6):
+            blocks.append(cur)
+            cur = []
+        cur.append(text.rstrip(".,!?"))
+        last_end = en
+    if cur:
+        blocks.append(cur)
+    body = _label_blocks(blocks)
+    if segs[0][0] > 8.0:
+        body = "[Intro]\n\n" + body
+    return body
+
+
+_KS_MAJOR = [6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88]
+_KS_MINOR = [6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17]
+_NOTES = ["C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"]
+
+
+def analyze_music(path: Path, max_sec: float):
+    """librosa 로 BPM / 키 / 실제 길이 추정."""
+    import librosa
+    import numpy as np
+    try:
+        total = float(librosa.get_duration(path=str(path)))
+    except Exception:
+        total = 0.0
+    y, sr = librosa.load(str(path), sr=22050, mono=True, offset=min(20.0, total * 0.15), duration=90.0)
+    bpm = None
+    keyscale = None
+    if len(y) > sr * 5:
+        tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
+        bpm = float(np.atleast_1d(tempo)[0])
+        while bpm and bpm < 60:
+            bpm *= 2
+        while bpm and bpm > 180:
+            bpm /= 2
+        bpm = int(round(bpm)) if bpm else None
+        chroma = librosa.feature.chroma_cqt(y=librosa.effects.harmonic(y), sr=sr).mean(axis=1)
+        best = (-2.0, None)
+        for i in range(12):
+            for prof, mode in ((_KS_MAJOR, "major"), (_KS_MINOR, "minor")):
+                r = float(np.corrcoef(chroma, np.roll(prof, i))[0, 1])
+                if r > best[0]:
+                    best = (r, f"{_NOTES[i]} {mode}")
+        keyscale = best[1]
+    return bpm, keyscale, total
+
+
+def build_caption(category: str, bpm, is_instrumental: bool):
+    if "발라드" in category and "K-pop" not in category:
+        base = "emotional Korean ballad, piano and strings, expressive lead vocal, clear diction"
+    elif "댄스" in category:
+        base = "Korean K-pop dance pop, punchy drums, synth bass, bright lead vocal"
+    else:
+        if bpm and bpm < 92:
+            base = "Korean pop ballad, warm band arrangement, expressive lead vocal"
+        else:
+            base = "Korean pop song, polished band arrangement, confident lead vocal"
+    if is_instrumental:
+        base = base.replace(", expressive lead vocal", "").replace(", bright lead vocal", "")
+        base = base.replace(", confident lead vocal", "") + ", instrumental"
+    return base
+
+
+def make_trigger(model_name: str) -> str:
+    slug = re.sub(r"[^a-z0-9]", "", model_name.lower())
+    if not slug:
+        slug = "sig" + hashlib.md5(model_name.encode("utf-8")).hexdigest()[:6]
+    return f"{slug} voice"
+
+
+def link_into_dataset(src: Path, dst: Path):
+    if dst.exists():
+        return
+    try:
+        os.link(fix_long_path(str(src)), str(dst))
+    except Exception:
+        shutil.copy2(fix_long_path(str(src)), str(dst))
+
+
+def plan_epochs(n_songs: int, preset: str):
+    """ACE-Step Side-Step 가이드: 1~10곡 200~500, 10~50곡 100~200, 50곡+ 50~100 epoch."""
+    base = 300 if n_songs <= 10 else 150 if n_songs <= 50 else 80
+    mult = {"fast": 0.5, "standard": 1.0, "deep": 1.6}.get(preset, 1.0)
+    cap = {"fast": 1500, "standard": 4000, "deep": 9000}.get(preset, 4000)
+    return max(5, min(int(base * mult), cap // max(1, n_songs)))
+
+
+# =============================================================================
 def main():
-    parser = argparse.ArgumentParser(description="5-Stage Vocal AI Training Pipeline with Resource Throttling")
-    parser.add_argument("--model-name", required=True, help="Name of the vocal model")
-    parser.add_argument("--file-list", default=None, help="JSON file containing list of input audio files")
-    parser.add_argument("--audio-files", nargs="*", default=[], help="List of input audio files")
-    parser.add_argument("--preset", default="standard", choices=["fast", "standard", "deep"], help="Training preset")
-    parser.add_argument("--genre-filter", default="kpop_ballad", choices=["kpop_ballad", "all"], help="Filter by target genres")
-    parser.add_argument("--output-dir", required=True, help="Trained vocal models base directory")
+    parser = argparse.ArgumentParser(description="ACE-Step LoRA vocal/style training pipeline")
+    parser.add_argument("--model-name", required=True)
+    parser.add_argument("--file-list", default=None)
+    parser.add_argument("--audio-files", nargs="*", default=[])
+    parser.add_argument("--preset", default="standard", choices=["fast", "standard", "deep"])
+    parser.add_argument("--genre-filter", default="kpop_ballad", choices=["kpop_ballad", "all"])
+    parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--skip-train", action="store_true", help="데이터셋만 만들고 학습은 생략 (점검용)")
     args = parser.parse_args()
 
     model_name = re.sub(r'[^\w\s-]', '', args.model_name).strip() or "CustomSinger"
-    base_out = Path(args.output_dir)
-    model_dir = base_out / model_name
-    model_dir.mkdir(parents=True, exist_ok=True)
-    work_dir = model_dir / "work"
-    work_dir.mkdir(parents=True, exist_ok=True)
-    slices_dir = work_dir / "slices"
-    slices_dir.mkdir(parents=True, exist_ok=True)
+    model_dir = Path(args.output_dir) / model_name
+    dataset_dir = model_dir / "dataset"
+    tensor_dir = model_dir / "tensors"
+    lora_dir = model_dir / "lora"
+    for d in (dataset_dir, tensor_dir, lora_dir):
+        d.mkdir(parents=True, exist_ok=True)
+
+    if not VENV_PY.exists() and not args.skip_train:
+        print(f"[ERROR] ACE-Step 학습 환경이 없습니다: {VENV_PY}", flush=True)
+        return 1
 
     raw_files = []
     if args.file_list and Path(args.file_list).exists():
         try:
-            raw_files = json.loads(Path(args.file_list).read_text(encoding="utf-8"))
+            raw_files = json.loads(Path(args.file_list).read_text(encoding="utf-8-sig"))
         except Exception as ex:
             log(f"⚠️ file-list 로드 경고: {ex}")
     if not raw_files and args.audio_files:
         raw_files = args.audio_files
+    audio_files = [Path(fix_long_path(str(f))) for f in raw_files if Path(fix_long_path(str(f))).exists()]
 
-    audio_files = []
-    for f in raw_files:
-        fixed_p = Path(fix_long_path(str(f)))
-        if fixed_p.exists():
-            audio_files.append(fixed_p)
+    cache_file = model_dir / "audio_cache.json"
+    try:
+        cache = json.loads(cache_file.read_text(encoding="utf-8")) if cache_file.exists() else {}
+    except Exception:
+        cache = {}
+    # 이전(가짜 학습) 버전 캐시에는 가사/BPM 라벨이 없으므로 다시 분석한다.
+    cache = {k: v for k, v in cache.items() if isinstance(v, dict) and "lyrics" in v}
 
-    if not audio_files:
+    if not audio_files and not cache:
         print("[ERROR] 유효한 음원 파일이 존재하지 않습니다.", flush=True)
         return 1
 
-    log(f"🚀 [{model_name}] 5단계 올인원 보컬 AI 학습 파이프라인 가동...")
-    log(f"• 학습 대상 음원 수: 총 {len(audio_files)}곡 | 학습 모드: {args.preset.upper()}")
-    filter_label = "K-pop & 감성 발라드 자동 선별 (타 장르 PASS)" if args.genre_filter == "kpop_ballad" else "전체 장르 학습"
-    log(f"• 장르 필터링 정책: {filter_label}")
-    log("• [자원 제어 안전 가드 가동] CPU 최대 2스레드 제한, GPU VRAM 50%(8GB) 상한제 및 순차 큐 적용")
+    trigger = make_trigger(model_name)
+    log(f"🚀 [{model_name}] ACE-Step LoRA 실제 학습 파이프라인 시작")
+    log(f"• 입력 음원 {len(audio_files)}곡 | 학습 모드 {args.preset.upper()} | 트리거 태그 '{trigger}'")
+    used, total = get_gpu_vram()
+    if total:
+        log(f"• GPU VRAM 사용 {used} / {total} MiB")
 
-    # VRAM 점유 체크
-    used_vram, total_vram = get_gpu_vram()
-    if total_vram > 0:
-        log(f"• [VRAM 관리자] RTX 5070 Ti 가용 VRAM: {used_vram} MiB / {total_vram} MiB (안전 범위)")
-
-    # 중복 학습 방지 캐시 로드
-    cache_file = model_dir / "audio_cache.json"
-    cache_data = {}
-    if cache_file.exists():
-        try:
-            cache_data = json.loads(cache_file.read_text(encoding="utf-8"))
-        except Exception:
-            cache_data = {}
-
-    import librosa
-    import soundfile as sf
-    import numpy as np
-
-    # -------------------------------------------------------------------------
-    # 1 & 2단계: 순차적 AI 반주 분리 & 오디오 슬라이싱 (자원 50% 상한제 & PASS)
-    # -------------------------------------------------------------------------
-    progress(1, 10, f"[1/5] {len(audio_files)}곡 장르 분석, 중복 검사 및 순차 분리 중...")
-    log(f"▶ [1단계: 순차적 AI 분리 & 2단계 슬라이싱] 총 {len(audio_files)}곡 순차 처리 시작...")
-
-    all_slice_files = []
-    new_processed_count = 0
-    skipped_count = 0
-    genre_skipped_count = 0
-
+    # ------------------------------------------------------------- 1단계
+    progress(1, 2, f"[1/5] {len(audio_files)}곡 장르 선별 및 중복 검사 중...")
+    todo = []
+    seen = set()
+    genre_skipped = dup_skipped = 0
     for idx, af in enumerate(audio_files):
-        # 1. 장르 필터링 검사 (K-pop & 발라드 전용 모드)
-        if args.genre_filter == "kpop_ballad":
-            is_target, reason, category = classify_audio_genre(af)
-            if not is_target:
-                genre_skipped_count += 1
-                log(f"  ⏭️ [장르 제외 PASS] ({idx+1}/{len(audio_files)}) '{af.name}' ({reason})")
-                continue
-            else:
-                log(f"  🎯 [타깃 일치: {category}] '{af.name}' ({reason})")
-
         sig = get_audio_signature(af)
-
-        # 2. 중복 음원 검사: 이미 학습 및 슬라이싱 완료된 파일인지 확인
-        if sig in cache_data:
-            entry = cache_data[sig]
-            valid_slices = [Path(p) for p in entry.get("slices", []) if Path(p).exists()]
-            if valid_slices:
-                skipped_count += 1
-                log(f"  ⏭️ [중복 PASS] ({idx+1}/{len(audio_files)}) '{af.name}' (이미 학습 완료된 음원 -> 건너뜀)")
-                for sp in valid_slices:
-                    all_slice_files.append((sp, 1.0))
+        if sig in seen:
+            dup_skipped += 1
+            continue
+        seen.add(sig)
+        if sig in cache:
+            dup_skipped += 1
+            continue
+        if args.genre_filter == "kpop_ballad":
+            ok, reason, category = classify_audio_genre(af)
+            if not ok:
+                genre_skipped += 1
+                log(f"  ⏭️ PASS ({reason}): {af.name}")
                 continue
+        else:
+            category = "K-pop/발라드"
+        todo.append((af, sig, category))
+        if idx % 10 == 0:
+            progress(1, 2 + int(idx / max(1, len(audio_files)) * 10), f"[1/5] 선별 중 ({idx + 1}/{len(audio_files)})")
+    log(f"  ✓ 신규 분석 {len(todo)}곡 | 이미 학습 데이터에 있음/중복 {dup_skipped}곡 | 장르 제외 {genre_skipped}곡")
 
-        # VRAM 안전 상한선 검사 (16GB의 50%인 8192 MiB 초과 시 쿨다운 대기)
-        v_used, _ = get_gpu_vram()
-        if v_used > 8192:
-            log(f"  ⚠️ [자원 가드] VRAM 50%({v_used} MiB) 초과 감지 -> 메모리 정리 및 쿨다운...")
-            gc.collect()
-            time.sleep(1.0)
-
-        new_processed_count += 1
-        pct = min(50, 10 + int((idx / len(audio_files)) * 40))
-        progress(1, pct, f"[1~2/5] ({idx+1}/{len(audio_files)}) '{af.name}' 순차 분석 및 슬라이싱 중...")
-        log(f"  ▶ ({idx+1}/{len(audio_files)}) '{af.name}' 신규 음원 분석 시작...")
-
-        # 1) 순수 보컬(Acapella) 분리
-        out_vocal = work_dir / f"vocal_{idx}.wav"
+    # ------------------------------------------------------------- 2단계
+    transcriber = Transcriber()
+    if todo:
+        log("▶ [2단계: 학습 라벨 생성] 가사(가사 파일 우선, 없으면 받아쓰기) + BPM/키 + 캡션")
+    for i, (af, sig, category) in enumerate(todo):
+        progress(2, 12 + int(i / max(1, len(todo)) * 26), f"[2/5] 곡 분석 ({i + 1}/{len(todo)}): {af.name[:40]}")
         try:
-            y, sr = librosa.load(str(af), sr=44100, mono=False)
-            if y.ndim > 1 and y.shape[0] == 2:
-                diff = (y[0] - y[1]) * 0.5
-                center = (y[0] + y[1]) * 0.5 - diff * 0.3
-                y_vocal = librosa.effects.harmonic(center, margin=2.5)
-            else:
-                y_mono = y if y.ndim == 1 else y.mean(axis=0)
-                y_vocal = librosa.effects.harmonic(y_mono, margin=2.5)
-            sf.write(str(out_vocal), y_vocal, sr)
-            log(f"    ✓ 반주 분리 완료 -> 순수 가창 추출 ({len(y_vocal)//sr}초)")
-        except Exception as ex:
-            log(f"    ⚠️ 직접 분리 대체 적용 ({ex})")
-            shutil.copy2(str(af), str(out_vocal))
+            bpm, keyscale, total_sec = analyze_music(af, MAX_TRAIN_SEC)
+        except Exception as e:
+            log(f"  ⚠️ 음원 분석 실패, 건너뜀: {af.name} ({e})")
+            continue
+        if total_sec and total_sec < 20:
+            log(f"  ⏭️ 20초 미만 음원 제외: {af.name}")
+            continue
 
-        # 2) 묵음/호흡 감지 슬라이싱
-        song_slices = []
+        lyrics, src = find_sidecar_lyrics(af)
+        if lyrics:
+            source = f"가사 파일({src})"
+        else:
+            segs = None
+            try:
+                segs = transcriber.transcribe(af, MAX_TRAIN_SEC)
+            except Exception as e:
+                log(f"  ⚠️ 받아쓰기 실패: {af.name} ({type(e).__name__}: {e})")
+            lyrics = structure_transcript(segs or [])
+            source = "Whisper 받아쓰기"
+        n_lines = len([l for l in lyrics.splitlines() if l.strip() and not _TAG_LINE.match(l)])
+        is_inst = n_lines < 3
+        if is_inst:
+            lyrics = "[Instrumental]"
+            source = "가사 없음(연주 위주로 학습)"
+
+        ext = af.suffix.lower()
+        link_name = f"trk_{sig.split('_')[-1]}{ext}"
         try:
-            y_v, sr_v = librosa.load(str(out_vocal), sr=44100)
-            intervals = librosa.effects.split(y_v, top_db=32)
-            for s_idx, (start, end) in enumerate(intervals):
-                dur_sec = (end - start) / sr_v
-                if 2.5 <= dur_sec <= 10.0:
-                    chunk = y_v[start:end]
-                    chunk_path = slices_dir / f"slice_{idx}_{s_idx}.wav"
-                    sf.write(str(chunk_path), chunk, sr_v)
-                    song_slices.append((chunk_path, float(np.std(chunk))))
-        except Exception as ex:
-            log(f"    ⚠️ 슬라이싱 대체 처리: {ex}")
-
-        if not song_slices:
-            fallback_chunk = slices_dir / f"slice_{idx}_0.wav"
-            shutil.copy2(str(out_vocal), str(fallback_chunk))
-            song_slices.append((fallback_chunk, 0.001))
-
-        log(f"    ✓ '{af.name}' -> {len(song_slices)}개 가창 세그먼트 생성 완료")
-        all_slice_files.extend(song_slices)
-
-        # 캐시 저장
-        cache_data[sig] = {
-            "name": af.name,
-            "slices": [str(s[0]) for s in song_slices],
-            "timestamp": time.time()
+            link_into_dataset(af, dataset_dir / link_name)
+        except Exception as e:
+            log(f"  ⚠️ 데이터셋 복사 실패, 건너뜀: {af.name} ({e})")
+            continue
+        cache[sig] = {
+            "source_name": af.name, "file": link_name, "category": category,
+            "lyrics": lyrics, "lyrics_source": source, "is_instrumental": is_inst,
+            "bpm": bpm, "keyscale": keyscale, "duration": round(total_sec, 1),
+            "caption": build_caption(category, bpm, is_inst),
         }
-        cache_file.write_text(json.dumps(cache_data, indent=2, ensure_ascii=False), encoding="utf-8")
+        cache_file.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+        log(f"  ✓ {af.name[:40]} | {source} {n_lines}줄 | BPM {bpm} | {keyscale}")
+    transcriber.unload()
 
-        # 순차 처리 후 즉시 메모리 정리 (자원 50% 유지)
-        gc.collect()
-        time.sleep(0.1)
+    samples = []
+    for sig, e in cache.items():
+        p = dataset_dir / e["file"]
+        if not p.exists():
+            continue
+        samples.append({
+            "audio_path": str(p), "filename": e["file"], "caption": e["caption"],
+            "lyrics": e["lyrics"], "bpm": e.get("bpm"), "keyscale": e.get("keyscale") or "",
+            "timesignature": "4", "language": "ko", "is_instrumental": e.get("is_instrumental", False),
+            "duration": min(e.get("duration") or MAX_TRAIN_SEC, MAX_TRAIN_SEC), "custom_tag": trigger,
+        })
+    if not samples:
+        print("[ERROR] 학습할 곡이 없습니다 (모두 제외되었거나 분석 실패).", flush=True)
+        return 1
+    with_lyrics = sum(1 for s in samples if not s["is_instrumental"])
+    log(f"• 학습 데이터셋: 총 {len(samples)}곡 (가사 포함 {with_lyrics}곡) — 이전 학습곡 누적 포함")
+    if with_lyrics < len(samples) * 0.5:
+        log("  ⚠️ 가사가 있는 곡이 절반 미만입니다. 음원 옆에 같은 이름의 .txt/.lrc 가사 파일을 두면 보컬 학습 품질이 크게 좋아집니다.")
 
-    log(f"  ✓ 음원 분석 완료 요약: 신규 처리 {new_processed_count}곡, 중복 PASS {skipped_count}곡")
-    log(f"  ✓ 누적 총 {len(all_slice_files)}개의 고품질 가창 세그먼트 데이터셋 확보")
+    dataset_json = model_dir / "dataset.json"
+    dataset_json.write_text(json.dumps({
+        "metadata": {"custom_tag": trigger, "tag_position": "prepend", "genre_ratio": 0},
+        "samples": samples,
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
+    # 곡 목록/라벨이 바뀌면 전처리 텐서의 캡션이 달라지므로, 사라진 곡의 텐서는 지운다.
+    valid_stems = {Path(s["filename"]).stem for s in samples}
+    for pt in tensor_dir.glob("*.pt"):
+        if pt.stem not in valid_stems:
+            pt.unlink(missing_ok=True)
 
-    # -------------------------------------------------------------------------
-    # 3단계: 가사 자동 받아쓰기 & 음성 라벨링 (ASR Dataset Alignment)
-    # -------------------------------------------------------------------------
-    progress(3, 55, "[3/5] 한국어 가창 음소 및 가사 자동 라벨링(ASR) 중...")
-    log(f"▶ [3단계: 가창 음소 라벨링] 총 {len(all_slice_files)}개 가창 세그먼트 인덱싱...")
+    epochs = plan_epochs(len(samples), args.preset)
+    save_every = max(5, epochs // 4)
+    log(f"• 학습 계획: {len(samples)}곡 × {epochs} epoch (ACE-Step 공식 가이드 기준, 모드 {args.preset})")
 
-    dataset_list_path = model_dir / "dataset.list"
-    lines = []
-    for sp, _ in all_slice_files:
-        lines.append(f"{sp.name}|{model_name}|ko|가창 음색 데이터셋 세그먼트")
-    dataset_list_path.write_text("\n".join(lines), encoding="utf-8")
-    log("  ✓ 데이터셋 인덱스(dataset.list) 및 언어 코드('ko') 정렬 완료")
+    if args.skip_train:
+        log("• --skip-train: 데이터셋까지만 생성했습니다.")
+        return 0
 
-    # -------------------------------------------------------------------------
-    # 4단계: RTX 5070 Ti 신경망 가창 모델 파인튜닝 (Neural Model Fine-Tuning)
-    # -------------------------------------------------------------------------
-    total_epochs = 10 if args.preset == "fast" else (15 if args.preset == "standard" else 25)
-    log(f"▶ [4단계: 신경망 파인튜닝] NVIDIA RTX 5070 Ti (총 {total_epochs} 에포크 학습 시작)...")
+    # ------------------------------------------------------------- 3~4단계
+    out_dir = lora_dir
+    if (out_dir / "final").exists():
+        shutil.rmtree(out_dir / "final", ignore_errors=True)
+    cmd = [str(VENV_PY), "-u", str(TRAINER),
+           "--dataset-json", str(dataset_json), "--tensor-dir", str(tensor_dir),
+           "--output-dir", str(out_dir), "--epochs", str(epochs),
+           "--max-duration", str(MAX_TRAIN_SEC), "--save-every", str(save_every)]
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
+    env.pop("OMP_NUM_THREADS", None)
+    env.pop("MKL_NUM_THREADS", None)
+    t0 = time.time()
+    adapter_path, final_loss, last_error = None, None, None
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env,
+                            text=True, encoding="utf-8", errors="replace", cwd=str(BASE_DIR / "audio_engines"))
+    for line in proc.stdout:
+        line = line.rstrip()
+        if not line:
+            continue
+        m = re.match(r"\[ADAPTER:(.+)\]$", line)
+        if m:
+            adapter_path = m.group(1)
+            continue
+        m = re.match(r"\[FINAL_LOSS:([\d.]+)\]$", line)
+        if m:
+            final_loss = float(m.group(1))
+            continue
+        if line.startswith("[ERROR]"):
+            last_error = line
+            log("  " + line)
+            continue
+        if line.startswith("[LOG]") or line.startswith("[PROGRESS:"):
+            print(line, flush=True)
+        elif re.search(r"error|traceback|exception", line, re.I):
+            log("  " + line[:300])
+    proc.wait()
+    if proc.returncode != 0 or not adapter_path:
+        print(last_error or f"[ERROR] LoRA 학습 프로세스 실패 (exit {proc.returncode})", flush=True)
+        return 1
 
-    for ep in range(1, total_epochs + 1):
-        pct = int(55 + (ep / total_epochs) * 40)
-        progress(4, pct, f"[4/5] RTX 5070 Ti 가창 신경망 학습 중 (Epoch {ep}/{total_epochs})...")
-        loss_val = max(0.082, 0.45 - (ep * 0.024) + (0.01 * (ep % 3)))
-        v_used, _ = get_gpu_vram()
-        log(f"  • [Epoch {ep:02d}/{total_epochs:02d}] Batch Loss: {loss_val:.4f} | VRAM: {v_used} MiB (안전 상한 50% 이내) | lr: 1e-4")
-        time.sleep(1.0)
-
-    # 가중치 저장 및 최적 Reference Audio 추출 (3초~10초 사이의 깨끗한 고성량 보컬 우선 선별)
-    model_pth = model_dir / f"{model_name}.pth"
-    ideal_candidates = [
-        s for s in all_slice_files
-        if Path(s[0]).exists() and 200000 <= Path(s[0]).stat().st_size <= 1200000
-    ]
-    if ideal_candidates:
-        best_slice = sorted(ideal_candidates, key=lambda x: x[1], reverse=True)[0][0]
-    else:
-        best_slice = sorted(all_slice_files, key=lambda x: x[1], reverse=True)[0][0]
-    ref_vocal_path = model_dir / "ref_vocal.wav"
-    shutil.copy2(str(best_slice), str(ref_vocal_path))
-
-    import torch
-    torch.save({
-        "model_name": model_name,
-        "epochs": total_epochs,
-        "samples_count": len(all_slice_files),
-        "created_at": time.time(),
-        "preset": args.preset
-    }, str(model_pth))
-    log(f"  ✓ 가창 신경망 가중치 저장 완료: {model_pth.name}")
-    log(f"  ✓ 최적 가창 참조 음원(Reference Vocal) 추출: {ref_vocal_path.name}")
-
-    # -------------------------------------------------------------------------
-    # 5단계: 모델 등록 & 가창 연동 준비 완료
-    # -------------------------------------------------------------------------
-    progress(5, 100, f"[5/5] '{model_name}' 모델 등록 및 가창 연동 완료!")
+    # ------------------------------------------------------------- 5단계
+    progress(5, 98, "[5/5] 학습된 보컬 모델 등록 중...")
+    meta_path = model_dir / "meta.json"
     meta = {
-        "model_name": model_name,
+        "name": model_name,
+        "engine": "ACE-Step 1.5 turbo",
+        "adapter_type": "lora",
+        "adapter_path": adapter_path,
+        "trigger_tag": trigger,
+        "caption_hint": samples[0]["caption"],
+        "songs_count": len(samples),
+        "songs_with_lyrics": with_lyrics,
+        "epochs": epochs,
+        "preset": args.preset,
+        "final_loss": final_loss,
+        "train_minutes": round((time.time() - t0) / 60, 1),
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "epochs": total_epochs,
-        "samples_count": len(all_slice_files),
-        "ref_audio": str(ref_vocal_path),
-        "weight_path": str(model_pth),
-        "preset": args.preset
     }
-    (model_dir / "meta.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
-    log(f"🎉 [5단계 완료] '{model_name}' 가창 모델 등록 성공!")
-    log(f"• [보컬 음악 스튜디오] 탭에서 '{model_name}' 목소리를 선택하고 바로 노래를 만드실 수 있습니다.")
-
+    meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    legacy = model_dir / "ref_vocal.wav"
+    if legacy.exists():
+        legacy.unlink(missing_ok=True)
+    legacy_work = model_dir / "work"
+    if legacy_work.exists():
+        shutil.rmtree(legacy_work, ignore_errors=True)
+    log(f"✅ 학습 완료: {model_name} | {len(samples)}곡 | {epochs} epoch | loss {final_loss}")
+    progress(5, 100, "[5/5] 학습 완료")
     print(f"[DONE:{model_name}]", flush=True)
     return 0
+
 
 if __name__ == "__main__":
     sys.exit(main())

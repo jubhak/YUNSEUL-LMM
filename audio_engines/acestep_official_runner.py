@@ -1,21 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-acestep_official_runner.py - Official ACE-Step 1.5 (DiT + 5Hz LM) 보컬 곡 생성기 (교체본)
+acestep_official_runner.py - Official ACE-Step 1.5 (DiT + 5Hz LM) 보컬 곡 생성기
 
-기존 대비 변경점
-1. transformers.PreTrainedModel.get_init_context 몽키패치를 제거했다.
-   - 이 패치는 모델 초기화 경로를 바꿔서, 가중치가 제대로 안 들어간 채 돌아가면
-     '잡음만 나오는' 증상의 유력한 원인이 된다.
-   - meta tensor 에러가 나면 패치로 덮지 말고 ACE-Step-1.5 가 요구하는 transformers 버전에 맞춘다.
-2. 실행 전 사전 점검: 레포 / CUDA / 체크포인트 폴더 / 가중치 파일 크기.
-3. 생성 직후 결과 음원을 스스로 분석(audio_verify)해서 잡음·무음이면 '성공'으로 처리하지 않고
-   종료코드 3 으로 끝낸다. (배치가 조용히 잡음 파일을 성공 처리하는 것을 막는다)
-4. 모든 실행 증거(모델명, LM 로드 여부, 스텝, 소요시간, 음원 분석 수치)를 <출력파일>.run.json 에 남긴다.
-5. LM 로드 실패 시 조용히 넘어가지 않고 로그와 run.json 에 lm_loaded=false 로 명시한다.
+- 학습된 보컬/스타일 LoRA(또는 LoKr)를 DiT에 로드해 생성에 반영 (--lora-path, --lora-scale)
+  로드에 실패하면 기본 보컬로 몰래 진행하지 않고 종료코드 4로 실패한다.
+- 공식 turbo 권장값: 8 steps, shift 3.0
+- 후보 여러 개(--candidates)를 한 번에 생성 -> 잡음 판정 + DiT 가사 정렬 점수로 최선의 테이크 선택
+- 최종 출력은 -14 LUFS 라우드니스 마스터링 후 320kbps(mp3) 저장, 다른 테이크도 _takeN 으로 보존
+- 실행 증거(모델, LoRA, LM, 점수, 분석 수치)는 <출력파일>.run.json 에 기록
 """
 import argparse
-import inspect
 import json
 import shutil
 import subprocess
@@ -64,7 +59,13 @@ def precheck() -> Path:
     if not torch.cuda.is_available():
         fail("CUDA 를 쓸 수 없습니다. RTX 50 시리즈(Blackwell)는 CUDA 12.8 이상용 torch 빌드가 필요합니다.\n"
              f"  현재 torch={torch.__version__}, torch.version.cuda={torch.version.cuda}")
-    log(f"torch={torch.__version__} cuda={torch.version.cuda} gpu={torch.cuda.get_device_name(0)}")
+    log(f"python={sys.version.split()[0]} torch={torch.__version__} cuda={torch.version.cuda} "
+        f"gpu={torch.cuda.get_device_name(0)}")
+    try:
+        import transformers
+        log(f"transformers={transformers.__version__}")
+    except ImportError:
+        pass
 
     ckpt = ACESTEP_ROOT / "checkpoints"
     if not ckpt.exists():
@@ -80,37 +81,96 @@ def precheck() -> Path:
     return ckpt
 
 
-def convert_for_output(src: Path, dst: Path):
-    """생성된 파일을 요청한 확장자로 맞춘다."""
+def export_master(src: Path, dst: Path, master: bool = True):
+    """생성 파일을 요청한 확장자로 저장. ffmpeg 가 있으면 라우드니스 마스터링을 함께 적용."""
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg:
+        cmd = [ffmpeg, "-y", "-loglevel", "error", "-i", str(src)]
+        if master:
+            cmd += ["-af", "loudnorm=I=-14:TP=-1.0:LRA=11", "-ar", "48000"]
+        if dst.suffix.lower() == ".mp3":
+            cmd += ["-c:a", "libmp3lame", "-b:a", "320k"]
+        cmd.append(str(dst))
+        r = subprocess.run(cmd)
+        if r.returncode == 0 and dst.exists():
+            return
+        log("[경고] ffmpeg 변환 실패 -> soundfile 로 저장 (마스터링 생략)")
     if src.suffix.lower() == dst.suffix.lower():
         shutil.copy2(src, dst)
         return
-    ffmpeg = shutil.which("ffmpeg")
-    if ffmpeg:
-        r = subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-i", str(src), str(dst)])
-        if r.returncode == 0 and dst.exists():
-            return
     import soundfile as sf
     y, sr = sf.read(str(src), always_2d=True)
-    sf.write(str(dst), y, sr)  # 확장자로 포맷 결정 (mp3 는 libsndfile 1.1+ 필요)
+    sf.write(str(dst), y, sr)
+
+
+def load_adapter(dit, path: str, scale: float, evidence: dict):
+    p = Path(path)
+    # 학습 출력 폴더를 넘겨도 final 어댑터를 찾아 쓴다
+    if p.is_dir() and not (p / "adapter_config.json").exists() and not list(p.glob("*.safetensors")):
+        if (p / "final").exists():
+            p = p / "final"
+    if not p.exists():
+        fail(f"LoRA 경로가 없습니다: {p}", 4)
+    log(f"학습된 어댑터 로드: {p} (반영 강도 {scale:.2f})")
+    msg = dit.add_lora(str(p), adapter_name="voice")
+    log(f"  -> {msg}")
+    if not str(msg).startswith("✅"):
+        fail(f"학습된 보컬 어댑터 로드 실패: {msg}\n"
+             f"  기본 보컬로 몰래 진행하지 않고 중단합니다. 모델을 다시 학습하거나 '기본 보컬'을 선택하세요.", 4)
+    smsg = dit.set_lora_scale("voice", float(scale))
+    log(f"  -> {smsg}")
+    evidence.update(lora_path=str(p), lora_scale=float(scale), lora_loaded=True)
+
+
+def lyric_alignment_scores(dit, extra: dict, n: int, language: str, steps: int) -> list:
+    """ACE-Step 공식 DiT 가사 정렬 점수 (높을수록 가사가 음성에 정확히 실림)."""
+    keys = {
+        "pred_latent": extra.get("pred_latents"),
+        "encoder_hidden_states": extra.get("encoder_hidden_states"),
+        "encoder_attention_mask": extra.get("encoder_attention_mask"),
+        "context_latents": extra.get("context_latents"),
+        "lyric_token_ids": extra.get("lyric_token_idss", extra.get("lyric_token_ids")),
+    }
+    if any(v is None for v in keys.values()):
+        return [None] * n
+    scores = []
+    for i in range(n):
+        try:
+            res = dit.get_lyric_score(
+                **{k: v[i:i + 1] for k, v in keys.items()},
+                vocal_language=language, inference_steps=steps, seed=42)
+            scores.append(float(res.get("dit_score")) if res.get("success") else None)
+        except Exception as e:  # noqa: BLE001
+            log(f"[경고] 가사 정렬 점수 계산 실패 (take {i + 1}): {e}")
+            scores.append(None)
+    return scores
 
 
 def main() -> int:
     p = argparse.ArgumentParser(description="Official ACE-Step 1.5 Vocal Music Generator")
     p.add_argument("--prompt-file", required=True)
     p.add_argument("--output", required=True)
-    p.add_argument("--duration", type=int, default=30)
+    p.add_argument("--duration", type=int, default=0, help="0 이하면 가사 길이에 맞춰 LM 이 결정")
     p.add_argument("--lyrics-file", default=None)
     p.add_argument("--steps", type=int, default=8, help="turbo 권장 8")
+    p.add_argument("--shift", type=float, default=3.0, help="turbo 공식 권장 3.0")
     p.add_argument("--ref-audio", default=None)
     p.add_argument("--task-type", default="text2music",
                    choices=["text2music", "cover", "style_transfer", "repaint"])
     p.add_argument("--bpm", type=int, default=None)
+    p.add_argument("--keyscale", default="")
+    p.add_argument("--timesignature", default="")
     p.add_argument("--vocal-language", default="ko")
+    p.add_argument("--lora-path", default=None, help="학습된 보컬/스타일 어댑터 폴더")
+    p.add_argument("--lora-scale", type=float, default=1.0)
+    p.add_argument("--candidates", type=int, default=2, help="한 번에 생성해 고를 테이크 수 (1~4)")
+    p.add_argument("--seed", type=int, default=-1)
     p.add_argument("--lm-model", default=None)
+    p.add_argument("--lm-temperature", type=float, default=0.85)
     p.add_argument("--no-thinking", action="store_true", help="5Hz LM 없이 DiT 만 사용")
     p.add_argument("--require-lm", action="store_true",
                    help="LM 로드에 실패하면 폴백하지 않고 실패 처리")
+    p.add_argument("--no-master", action="store_true", help="라우드니스 마스터링 생략")
     p.add_argument("--allow-suspect", action="store_true",
                    help="잡음 의심 판정이어도 성공(0)으로 종료 (기본: 종료코드 3)")
     args = p.parse_args()
@@ -140,8 +200,7 @@ def main() -> int:
         from acestep.gpu_config import set_global_gpu_config, get_gpu_config
     except Exception as e:  # noqa: BLE001
         fail(f"acestep 임포트 실패: {type(e).__name__}: {e}\n"
-             f"  해결: cd \"{ACESTEP_ROOT}\" 에서 의존성 설치(pip install -e .). "
-             f"meta tensor 에러라면 transformers 버전을 ACE-Step-1.5 가 요구하는 버전으로 맞추세요.")
+             f"  해결: audio_engines\\venv_acestep 의 Python 으로 실행해야 합니다 (transformers 4.57.x).")
 
     try:
         gpu_cfg = get_gpu_config()
@@ -150,11 +209,14 @@ def main() -> int:
     except Exception as e:  # noqa: BLE001
         log(f"[경고] GPU 구성 감지 실패(기본값 사용): {e}")
 
-    duration = max(10, min(600, int(args.duration)))
-    steps = min(12, max(8, args.steps))
+    duration = -1.0 if args.duration <= 0 else float(max(10, min(600, args.duration)))
+    steps = min(20, max(4, args.steps))
+    candidates = min(4, max(1, args.candidates))
     evidence = {
-        "dit_model": "acestep-v15-turbo", "steps": steps, "duration_req": duration,
-        "caption": caption, "lyrics_chars": len(lyrics), "lm_loaded": False, "lm_model": None,
+        "dit_model": "acestep-v15-turbo", "steps": steps, "shift": args.shift,
+        "duration_req": duration, "caption": caption, "lyrics_chars": len(lyrics),
+        "bpm": args.bpm, "keyscale": args.keyscale, "candidates": candidates,
+        "lm_loaded": False, "lm_model": None, "lora_loaded": False,
     }
 
     # ---- DiT ----
@@ -170,13 +232,16 @@ def main() -> int:
     if not ok:
         fail(f"DiT 초기화 실패: {status}")
 
+    if args.lora_path:
+        load_adapter(dit, args.lora_path, args.lora_scale, evidence)
+
     # ---- LM ----
     thinking = not args.no_thinking
     llm = LLMHandler()
     if thinking:
-        candidates = [args.lm_model] if args.lm_model else ["acestep-5Hz-lm-1.7B", "acestep-5Hz-lm-0.6B"]
+        candidates_lm = [args.lm_model] if args.lm_model else ["acestep-5Hz-lm-1.7B", "acestep-5Hz-lm-0.6B"]
         last_err = ""
-        for name in candidates:
+        for name in candidates_lm:
             if dir_weight_mb(ckpt / name) < 100:
                 last_err = f"{name}: 체크포인트 폴더에 가중치 없음"
                 log(f"LM 후보 건너뜀 -> {last_err}")
@@ -212,28 +277,33 @@ def main() -> int:
         task_type=args.task_type,
         thinking=thinking,
         use_cot_metas=thinking,
-        use_cot_caption=thinking,
-        use_cot_language=thinking,
+        # 학습 어댑터의 트리거 태그가 LM 캡션 재작성으로 사라지지 않게 한다
+        use_cot_caption=thinking and not evidence["lora_loaded"],
+        use_cot_language=False,
         caption=caption,
         lyrics=lyrics if has_lyrics else "",
         instrumental=not has_lyrics,
         bpm=args.bpm,
-        keyscale="",
-        timesignature="",
+        keyscale=args.keyscale,
+        timesignature=args.timesignature,
         vocal_language=args.vocal_language,
         duration=duration,
         inference_steps=steps,
+        shift=args.shift,
+        seed=args.seed,
+        lm_temperature=args.lm_temperature,
         enable_normalization=True,
         normalization_db=-1.0,
+        fade_out_duration=1.5,
         reference_audio=ref,
     )
-    try:
-        config = GenerationConfig(batch_size=1, audio_format="flac")
-    except TypeError:
-        log(f"GenerationConfig 시그니처: {inspect.signature(GenerationConfig)}")
-        raise
+    config = GenerationConfig(batch_size=candidates, audio_format="flac",
+                              use_random_seed=args.seed < 0,
+                              seeds=None if args.seed < 0 else [args.seed + i for i in range(candidates)])
 
-    log(f"곡 생성 시작 (duration={duration}s, steps={steps}, thinking={thinking})...")
+    log(f"곡 생성 시작 (duration={'auto' if duration < 0 else int(duration)}, steps={steps}, "
+        f"shift={args.shift}, takes={candidates}, thinking={thinking}, "
+        f"lora={'on' if evidence['lora_loaded'] else 'off'})...")
     t0 = time.time()
     try:
         result = generate_music(dit, llm, params=params, config=config, save_dir=str(tmp_dir))
@@ -242,31 +312,52 @@ def main() -> int:
     elapsed = time.time() - t0
     evidence["elapsed_sec"] = round(elapsed, 1)
 
-    if not (getattr(result, "success", False) and getattr(result, "audios", None)):
+    audios = getattr(result, "audios", None) or []
+    if not (getattr(result, "success", False) and audios):
         fail(f"생성 실패: {getattr(result, 'status_message', '')} / {getattr(result, 'error', '')}", 1)
+    log(f"생성 완료 ({elapsed:.1f}s, {len(audios)}개 테이크)")
 
-    gen_file = Path(result.audios[0]["path"])
-    log(f"생성 완료 ({elapsed:.1f}s) -> {gen_file}")
-
-    # ---- 결과 검증 ----
+    # ---- 테이크 검증 및 선택 ----
     from audio_verify import analyze, verdict
-    info = analyze(gen_file)
-    v, reasons = verdict(info)
-    evidence["analysis"] = info
-    evidence["verdict"] = v
-    evidence["verdict_reasons"] = reasons
-    log(f"음원 분석: {info['sample_rate']}Hz {info['channels']}ch {info['duration_sec']}s "
-        f"peak={info['peak']:.3f} rms={info['rms']:.3f} flatness={info.get('median_flatness')} "
-        f"hf_ratio={info.get('hf_ratio')}")
-    log(f"판정: {v} {reasons if reasons else ''}")
+    align = lyric_alignment_scores(dit, getattr(result, "extra_outputs", {}) or {}, len(audios),
+                                   args.vocal_language, steps) if has_lyrics else [None] * len(audios)
+    takes = []
+    for i, a in enumerate(audios):
+        f = Path(a.get("path") or "")
+        if not f.exists():
+            continue
+        info = analyze(f)
+        v, reasons = verdict(info)
+        takes.append({"idx": i, "path": f, "verdict": v, "reasons": reasons, "analysis": info,
+                      "align": align[i] if i < len(align) else None, "seed": a.get("params", {}).get("seed")})
+        log(f"  take {i + 1}: 판정={v} 가사정렬={takes[-1]['align']} rms={info['rms']:.3f} "
+            f"flatness={info.get('median_flatness')}")
+    if not takes:
+        fail("생성된 음원 파일을 찾지 못했습니다.", 1)
+
+    takes.sort(key=lambda t: (t["verdict"] == "OK", t["align"] if t["align"] is not None else -1.0),
+               reverse=True)
+    best = takes[0]
+    v = best["verdict"]
+    evidence.update(
+        analysis=best["analysis"], verdict=v, verdict_reasons=best["reasons"],
+        best_take=best["idx"] + 1, best_seed=best["seed"],
+        lm_metadata=(getattr(result, "extra_outputs", {}) or {}).get("lm_metadata"),
+        takes=[{"take": t["idx"] + 1, "verdict": t["verdict"], "align": t["align"], "seed": t["seed"]}
+               for t in takes],
+    )
+    log(f"최종 선택: take {best['idx'] + 1} (판정 {v}, 가사정렬 {best['align']})")
 
     final = out_path
     if v != "OK" and not args.allow_suspect:
         final = out_path.with_name(f"{out_path.stem}.{v}_SUSPECT{out_path.suffix}")
-    convert_for_output(gen_file, final)
+    export_master(best["path"], final, master=not args.no_master)
+    for t in takes[1:]:
+        export_master(t["path"], out_path.with_name(f"{out_path.stem}_take{t['idx'] + 1}{out_path.suffix}"),
+                      master=not args.no_master)
     evidence["final_output"] = str(final)
     Path(str(out_path) + ".run.json").write_text(
-        json.dumps(evidence, ensure_ascii=False, indent=2), encoding="utf-8")
+        json.dumps(evidence, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
     log(f"최종 출력: {final} ({final.stat().st_size} bytes)")
     log(f"실행 증거: {out_path}.run.json")
 
