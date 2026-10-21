@@ -17,7 +17,7 @@ from text_engine import ollama_generate, strip_thinking
 GENRE_LYRIC_GUIDE: Dict[str, dict] = {
     "ballad_acoustic": {
         "name": "감성 어쿠스틱 발라드",
-        "bpm": 68, "keyscale": "C Major", "syllables": (7, 10),
+        "bpm": 68, "keyscale": "C Major", "syllables": (6, 9),
         "tone": "담담하게 시작해 후렴에서 감정이 차오르는 고백. 일상의 작은 장면으로 이별/그리움을 보여준다",
         "english": "영어를 쓰지 않는다",
         "tags": {"Intro": "Intro - acoustic guitar", "Bridge": "Bridge - soft",
@@ -25,7 +25,7 @@ GENRE_LYRIC_GUIDE: Dict[str, dict] = {
     },
     "ballad_orchestral": {
         "name": "오케스트라 팝 발라드",
-        "bpm": 72, "keyscale": "D Major", "syllables": (7, 10),
+        "bpm": 72, "keyscale": "D Major", "syllables": (6, 9),
         "tone": "영화 같은 장면 전환, 절정에서 크게 터지는 고음 후렴",
         "english": "영어를 쓰지 않는다",
         "tags": {"Intro": "Intro - piano", "Bridge": "Bridge - building energy",
@@ -59,7 +59,7 @@ GENRE_LYRIC_GUIDE: Dict[str, dict] = {
 GENRE_LYRIC_GUIDE.update({
     "ballad_piano": {
         "name": "피아노 발라드",
-        "bpm": 66, "keyscale": "Eb Major", "syllables": (7, 10),
+        "bpm": 66, "keyscale": "Eb Major", "syllables": (6, 9),
         "tone": "조용한 독백으로 시작해 후렴에서 참았던 말을 꺼내는 고백. 방 안, 창가, 버스 정류장 같은 작은 장면",
         "english": "영어를 쓰지 않는다",
         "tags": {"Intro": "Intro - solo piano", "Bridge": "Bridge - quiet then rising",
@@ -75,7 +75,7 @@ GENRE_LYRIC_GUIDE.update({
     },
     "ost_drama": {
         "name": "드라마 OST 발라드",
-        "bpm": 70, "keyscale": "D Major", "syllables": (7, 10),
+        "bpm": 70, "keyscale": "D Major", "syllables": (6, 9),
         "tone": "두 사람의 엇갈림과 기다림. 장면이 눈앞에 그려지는 서사, 후렴은 누구나 따라 부를 쉬운 말",
         "english": "영어를 쓰지 않는다",
         "tags": {"Intro": "Intro - piano and strings", "Bridge": "Bridge - building strings",
@@ -101,12 +101,15 @@ GENRE_LYRIC_GUIDE.update({
 GENRE_LYRIC_GUIDE["custom"] = dict(GENRE_LYRIC_GUIDE["ballad_acoustic"], name="자유 장르")
 
 # ACE-Step 캡션: 장르별 편곡/음색 묘사 ({vocal} 자리에 female/male vocals 등이 들어간다)
+QUALITY_TAIL = ("smooth legato {vocal}, in-tune singing, natural phrasing, clear Korean diction, "
+                "gentle vibrato, breath control, studio mix, no shouting, no robotic timing")
+
 GENRE_CAPTION = {
-    "ballad_piano": "Korean piano ballad, emotional {vocal}, grand piano, soft strings, slow tempo, intimate verses, soaring chorus",
+    "ballad_piano": "Korean piano ballad, intimate emotional {vocal}, grand piano, soft strings, slow tempo, close-mic verses, soaring but controlled chorus",
     "ballad_acoustic": "Korean acoustic ballad, warm {vocal}, fingerpicked acoustic guitar, soft piano, light strings, gentle and sentimental",
-    "ballad_orchestral": "Korean orchestral pop ballad, powerful {vocal}, grand piano, cinematic string ensemble, big drums in final chorus, dramatic build-up",
-    "ballad_rnb": "Korean R&B ballad, smooth soulful {vocal}, electric piano, warm bass, soft drums, vocal runs, late night mood",
-    "ost_drama": "Korean drama OST ballad, heartfelt {vocal}, piano and strings, cinematic, emotional climax, clear diction",
+    "ballad_orchestral": "Korean orchestral pop ballad, powerful yet controlled {vocal}, grand piano, cinematic strings, big drums in final chorus",
+    "ballad_rnb": "Korean R&B ballad, smooth soulful {vocal}, electric piano, warm bass, soft drums, tasteful vocal runs, late night mood",
+    "ost_drama": "Korean drama OST ballad, heartfelt {vocal}, piano and strings, cinematic, emotional climax, crystal-clear diction",
     "kpop_rock": "Korean rock ballad, passionate {vocal}, overdrive electric guitar, live drums, emotional soaring climax",
     "indie_folk": "Korean indie folk, gentle {vocal}, acoustic guitar, soft percussion, warm and intimate",
     "citypop": "Korean city pop, smooth {vocal}, groovy bass, clean electric guitar, synth pads, nostalgic 80s",
@@ -135,6 +138,7 @@ def build_caption(genre_key: str, gender: str = "", moods=(), extra: str = "") -
         cap += ", " + ", ".join(mood_words)
     if extra.strip():
         cap += ", " + extra.strip().strip(",")
+    cap += ", " + QUALITY_TAIL.format(vocal=vocal)
     return cap
 
 # (고유 섹션, 줄 수) - LLM이 쓰는 단위
@@ -178,7 +182,7 @@ LYRICIST_SYSTEM = """당신은 한국 대중가요 히트곡을 여럿 쓴 작�
 - 한 곡에는 중심 이미지(은유) 하나만 쓰고, 그 이미지를 섹션마다 다른 각도로 변주한다. 이미지를 섞지 않는다.
 - 그리움, 슬픔, 운명, 영원 같은 추상어를 나열하지 말고 구체적인 장면, 사물, 행동으로 감정을 보여준다.
 - 형용사를 쌓지 않는다.
-- 한 줄은 한 숨에 부를 수 있는 길이로 쓰고, 같은 섹션 안의 줄은 음절 수를 비슷하게 맞춘다.
+- 한 줄은 한 숨에 자연스럽게 부를 길이로 쓰고, 같은 섹션 안의 줄은 음절 수를 비슷하게 맞춘다. 혀가 꼬이는 말, 막히는 받침 연속은 피한다.
 - 줄 끝 모음이나 받침을 맞춰 운율을 만든다.
 - Verse는 이야기를 진행하고, Pre-Chorus는 긴장을 쌓고, Chorus는 곡의 제목이 될 한 줄 훅을 첫 줄이나 마지막 줄에 둔다.
 - Verse 2는 Verse 1과 다른 시간, 다른 장면으로 이야기를 전진시키고 Verse 1의 줄을 재사용하지 않는다.

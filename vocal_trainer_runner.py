@@ -384,6 +384,153 @@ def plan_epochs(n_songs: int, preset: str):
     return max(5, min(int(base * mult), cap // max(1, n_songs)))
 
 
+def plan_speech_epochs(n_clips: int, preset: str):
+    """짧은 낭독 클립용. 클립이 적으면 epoch 를 늘리고, 표준은 대략 15~40분 목표."""
+    base = 120 if n_clips < 10 else 90 if n_clips < 20 else 70
+    mult = {"fast": 0.5, "standard": 1.0, "deep": 1.6}.get(preset, 1.0)
+    return max(20, int(base * mult))
+
+
+def prepare_speech_clip(src: Path, dst: Path, max_sec: float = 20.0):
+    """모노 48k WAV 로 맞추고, 너무 짧은 클립은 앞뒤에 무음을 붙인다."""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        shutil.copy2(src, dst)
+        return dst
+    af = "highpass=f=70,loudnorm=I=-16:TP=-1.5:LRA=11,apad=pad_dur=1.2"
+    r = subprocess.run(
+        [ffmpeg, "-y", "-loglevel", "error", "-i", str(src), "-af", af,
+         "-t", str(max_sec), "-ar", "48000", "-ac", "1", str(dst)],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0 or not dst.exists():
+        shutil.copy2(src, dst)
+    return dst
+
+
+def train_speech_voice(args) -> int:
+    """따라 읽은 문장 녹음으로 음색 LoRA 를 학습하고 별칭으로 등록한다."""
+    payload = json.loads(Path(args.clips_json).read_text(encoding="utf-8-sig"))
+    clips = payload.get("clips") or []
+    gender = (payload.get("gender") or args.gender or "female").lower()
+    if gender not in ("female", "male"):
+        gender = "female"
+    gender_en = "female" if gender == "female" else "male"
+    model_name = re.sub(r"[^\w\s-]", "", args.model_name).strip() or "MyVoice"
+    model_dir = Path(args.output_dir) / model_name
+    dataset_dir = model_dir / "dataset"
+    tensor_dir = model_dir / "tensors"
+    lora_dir = model_dir / "lora"
+    for d in (dataset_dir, tensor_dir, lora_dir):
+        d.mkdir(parents=True, exist_ok=True)
+
+    if not VENV_PY.exists() and not args.skip_train:
+        print(f"[ERROR] ACE-Step 학습 환경이 없습니다: {VENV_PY}", flush=True)
+        return 1
+
+    trigger = make_trigger(model_name)
+    progress(1, 8, "[1/5] 녹음 문장 정리 중...")
+    samples = []
+    for i, c in enumerate(clips, 1):
+        src = Path(c.get("path") or "")
+        text = (c.get("text") or "").strip()
+        if not src.exists() or not text:
+            log(f"  ⚠️ 건너뜀 ({i}): 파일 또는 문장 없음")
+            continue
+        dst = dataset_dir / f"clip_{i:02d}.wav"
+        try:
+            prepare_speech_clip(src, dst)
+        except Exception as e:
+            log(f"  ⚠️ 변환 실패 {src.name}: {e}")
+            continue
+        caption = (f"{trigger}, dry studio close-mic a cappella {gender_en} vocal, "
+                   "natural Korean singing voice, clear diction, no instruments, no reverb")
+        samples.append({
+            "audio_path": str(dst), "filename": dst.name, "caption": caption,
+            "lyrics": f"[Verse]\n{text}", "bpm": 72, "keyscale": "",
+            "timesignature": "4", "language": "ko", "is_instrumental": False,
+            "duration": 20.0, "custom_tag": trigger,
+        })
+        log(f"  ✓ {i:02d} {text[:28]}")
+
+    if len(samples) < 5:
+        print("[ERROR] 학습에 쓸 녹음이 너무 적습니다. 문장을 5개 이상 녹음해 주세요.", flush=True)
+        return 1
+
+    dataset_json = model_dir / "dataset.json"
+    dataset_json.write_text(json.dumps({
+        "metadata": {"custom_tag": trigger, "tag_position": "prepend", "genre_ratio": 0},
+        "samples": samples,
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
+    valid = {Path(s["filename"]).stem for s in samples}
+    for pt in tensor_dir.glob("*.pt"):
+        if pt.stem not in valid:
+            pt.unlink(missing_ok=True)
+
+    epochs = plan_speech_epochs(len(samples), args.preset)
+    save_every = max(5, epochs // 4)
+    log(f"🚀 [{model_name}] 내 목소리 학습 시작 — {len(samples)}문장, {gender_en}, {epochs} epoch")
+    progress(2, 20, f"[2/5] {len(samples)}문장 데이터셋 준비 완료")
+
+    if args.skip_train:
+        log("• --skip-train: 데이터셋까지만 생성했습니다.")
+        return 0
+
+    if (lora_dir / "final").exists():
+        shutil.rmtree(lora_dir / "final", ignore_errors=True)
+    cmd = [str(VENV_PY), "-u", str(TRAINER),
+           "--dataset-json", str(dataset_json), "--tensor-dir", str(tensor_dir),
+           "--output-dir", str(lora_dir), "--epochs", str(epochs),
+           "--max-duration", "20", "--rank", "32", "--save-every", str(save_every)]
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
+    t0 = time.time()
+    adapter_path, final_loss, last_error = None, None, None
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env,
+                            text=True, encoding="utf-8", errors="replace", cwd=str(BASE_DIR / "audio_engines"))
+    for line in proc.stdout:
+        line = line.rstrip()
+        if not line:
+            continue
+        m = re.match(r"\[ADAPTER:(.+)\]$", line)
+        if m:
+            adapter_path = m.group(1)
+            continue
+        m = re.match(r"\[FINAL_LOSS:([\d.]+)\]$", line)
+        if m:
+            final_loss = float(m.group(1))
+            continue
+        if line.startswith("[ERROR]"):
+            last_error = line
+            log("  " + line)
+            continue
+        if line.startswith("[LOG]") or line.startswith("[PROGRESS:"):
+            print(line, flush=True)
+        elif re.search(r"error|traceback|exception", line, re.I):
+            log("  " + line[:300])
+    proc.wait()
+    if proc.returncode != 0 or not adapter_path:
+        print(last_error or f"[ERROR] LoRA 학습 프로세스 실패 (exit {proc.returncode})", flush=True)
+        return 1
+
+    progress(5, 98, "[5/5] 별칭으로 목소리 등록 중...")
+    meta = {
+        "name": model_name, "kind": "speech_clone", "gender": gender_en,
+        "engine": "ACE-Step 1.5 turbo", "adapter_type": "lora",
+        "adapter_path": adapter_path, "trigger_tag": trigger,
+        "clips_count": len(samples), "songs_count": len(samples),
+        "songs_with_lyrics": len(samples), "epochs": epochs, "preset": args.preset,
+        "final_loss": final_loss, "train_minutes": round((time.time() - t0) / 60, 1),
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    (model_dir / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    log(f"✅ 내 목소리 등록: {model_name} | {len(samples)}문장 | {epochs} epoch")
+    progress(5, 100, "[5/5] 학습 완료")
+    print(f"[DONE:{model_name}]", flush=True)
+    return 0
+
+
 # =============================================================================
 def main():
     parser = argparse.ArgumentParser(description="ACE-Step LoRA vocal/style training pipeline")
@@ -394,7 +541,16 @@ def main():
     parser.add_argument("--genre-filter", default="kpop_ballad", choices=["kpop_ballad", "all"])
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--skip-train", action="store_true", help="데이터셋만 만들고 학습은 생략 (점검용)")
+    parser.add_argument("--mode", default="songs", choices=["songs", "speech"])
+    parser.add_argument("--clips-json", default=None, help="따라 읽기 학습용 클립 목록")
+    parser.add_argument("--gender", default="female", choices=["female", "male"])
     args = parser.parse_args()
+
+    if args.mode == "speech":
+        if not args.clips_json or not Path(args.clips_json).exists():
+            print("[ERROR] --clips-json 파일이 필요합니다.", flush=True)
+            return 1
+        return train_speech_voice(args)
 
     model_name = re.sub(r'[^\w\s-]', '', args.model_name).strip() or "CustomSinger"
     model_dir = Path(args.output_dir) / model_name
@@ -598,6 +754,7 @@ def main():
     meta_path = model_dir / "meta.json"
     meta = {
         "name": model_name,
+        "kind": "song_lora",
         "engine": "ACE-Step 1.5 turbo",
         "adapter_type": "lora",
         "adapter_path": adapter_path,

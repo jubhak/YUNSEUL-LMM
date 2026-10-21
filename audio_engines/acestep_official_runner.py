@@ -82,18 +82,24 @@ def precheck() -> Path:
 
 
 def export_master(src: Path, dst: Path, master: bool = True):
-    """생성 파일을 요청한 확장자로 저장. ffmpeg 가 있으면 라우드니스 마스터링을 함께 적용."""
+    """생성 파일을 요청한 확장자로 저장. ffmpeg 가 있으면 라우드니스·보컬 다듬기를 함께 적용."""
     ffmpeg = shutil.which("ffmpeg")
+    filters = [
+        ("loudnorm=I=-14:TP=-1.5:LRA=8,highpass=f=70,acompressor=threshold=-18dB:ratio=2.2:attack=25:release=200:makeup=1.5", 48000),
+        ("loudnorm=I=-14:TP=-1.0:LRA=11", 48000),
+    ]
     if ffmpeg:
-        cmd = [ffmpeg, "-y", "-loglevel", "error", "-i", str(src)]
-        if master:
-            cmd += ["-af", "loudnorm=I=-14:TP=-1.0:LRA=11", "-ar", "48000"]
-        if dst.suffix.lower() == ".mp3":
-            cmd += ["-c:a", "libmp3lame", "-b:a", "320k"]
-        cmd.append(str(dst))
-        r = subprocess.run(cmd)
-        if r.returncode == 0 and dst.exists():
-            return
+        for af, ar in (filters if master else [(None, None)]):
+            cmd = [ffmpeg, "-y", "-loglevel", "error", "-i", str(src)]
+            if af:
+                cmd += ["-af", af, "-ar", str(ar)]
+            if dst.suffix.lower() == ".mp3":
+                cmd += ["-c:a", "libmp3lame", "-b:a", "320k"]
+            cmd.append(str(dst))
+            r = subprocess.run(cmd)
+            if r.returncode == 0 and dst.exists() and dst.stat().st_size > 1024:
+                return
+            log("[경고] ffmpeg 변환 실패, 더 단순한 마스터링으로 재시도")
         log("[경고] ffmpeg 변환 실패 -> soundfile 로 저장 (마스터링 생략)")
     if src.suffix.lower() == dst.suffix.lower():
         shutil.copy2(src, dst)
@@ -152,7 +158,7 @@ def main() -> int:
     p.add_argument("--output", required=True)
     p.add_argument("--duration", type=int, default=0, help="0 이하면 가사 길이에 맞춰 LM 이 결정")
     p.add_argument("--lyrics-file", default=None)
-    p.add_argument("--steps", type=int, default=8, help="turbo 권장 8")
+    p.add_argument("--steps", type=int, default=10, help="품질 기본 10 (turbo 최소 8)")
     p.add_argument("--shift", type=float, default=3.0, help="turbo 공식 권장 3.0")
     p.add_argument("--ref-audio", default=None)
     p.add_argument("--task-type", default="text2music",
@@ -166,7 +172,9 @@ def main() -> int:
     p.add_argument("--candidates", type=int, default=2, help="한 번에 생성해 고를 테이크 수 (1~4)")
     p.add_argument("--seed", type=int, default=-1)
     p.add_argument("--lm-model", default=None)
-    p.add_argument("--lm-temperature", type=float, default=0.85)
+    p.add_argument("--lm-temperature", type=float, default=0.72)
+    p.add_argument("--title", default="")
+    p.add_argument("--cover-image", default=None)
     p.add_argument("--no-thinking", action="store_true", help="5Hz LM 없이 DiT 만 사용")
     p.add_argument("--require-lm", action="store_true",
                    help="LM 로드에 실패하면 폴백하지 않고 실패 처리")
@@ -294,7 +302,7 @@ def main() -> int:
         lm_temperature=args.lm_temperature,
         enable_normalization=True,
         normalization_db=-1.0,
-        fade_out_duration=1.5,
+        fade_out_duration=2.0,
         reference_audio=ref,
     )
     config = GenerationConfig(batch_size=candidates, audio_format="flac",
@@ -358,6 +366,19 @@ def main() -> int:
     evidence["final_output"] = str(final)
     Path(str(out_path) + ".run.json").write_text(
         json.dumps(evidence, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    try:
+        sys.path.insert(0, str(HERE.parent))
+        from mp3_meta import embed_mp3_meta
+        tagged = [final, *[out_path.with_name(f"{out_path.stem}_take{t['idx'] + 1}{out_path.suffix}")
+                           for t in takes[1:]]]
+        for f in tagged:
+            if f.exists() and f.suffix.lower() == ".mp3":
+                embed_mp3_meta(f, title=args.title or out_path.stem, lyrics=lyrics,
+                               cover_path=args.cover_image)
+        log("MP3 태그: 제목·가사 기록")
+    except Exception as e:  # noqa: BLE001
+        log(f"[경고] MP3 태그 기록 실패: {e}")
+
     log(f"최종 출력: {final} ({final.stat().st_size} bytes)")
     log(f"실행 증거: {out_path}.run.json")
 

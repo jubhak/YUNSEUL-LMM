@@ -68,6 +68,7 @@ ACESTEP_PY = BASE_DIR / "audio_engines" / "venv_acestep" / "Scripts" / "python.e
 from ebook_writer import save_ebook_auto_increment, markdown_to_book_html, EbookWriter
 from text_engine import GenerationCancelled, ollama_generate
 from song_studio import SongStudio
+from voice_clone_pane import VoiceClonePane
 
 def get_python_exe():
     if getattr(sys, "frozen", False):
@@ -472,12 +473,16 @@ class VocalTrainingWorker(QThread):
     sig_log = pyqtSignal(str)
     sig_finished = pyqtSignal(bool, str, str)
 
-    def __init__(self, model_name, audio_files, preset="standard", genre_filter="kpop_ballad"):
+    def __init__(self, model_name, audio_files, preset="standard", genre_filter="kpop_ballad",
+                 mode="songs", clips_json=None, gender="female"):
         super().__init__()
         self.model_name = re.sub(r'[^\w\s-]', '', model_name).strip() or "CustomSinger"
         self.audio_files = [str(Path(p).resolve()) for p in audio_files if Path(p).exists()]
         self.preset = preset
         self.genre_filter = genre_filter
+        self.mode = mode
+        self.clips_json = clips_json
+        self.gender = gender
         self._is_cancelled = False
         self.proc = None
         self.start_time = None
@@ -502,7 +507,8 @@ class VocalTrainingWorker(QThread):
         self.start_time = time.time()
         try:
             # 0. VRAM 중재 (Ollama LLM 언로드)
-            self.sig_log.emit(f"🚀 [{self.model_name}] 5단계 올인원 보컬 AI 학습 파이프라인 가동...")
+            kind = "내 목소리 따라 읽기" if self.mode == "speech" else "5단계 올인원 보컬 AI"
+            self.sig_log.emit(f"🚀 [{self.model_name}] {kind} 학습 파이프라인 가동...")
             self.sig_log.emit("• [VRAM 관리자] 학습을 위한 GPU VRAM(16GB) 전용 공간 확보 중...")
             subprocess.run(["ollama", "stop", "qwen3:14b"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=CREATE_NO_WINDOW)
             time.sleep(1.0)
@@ -511,9 +517,6 @@ class VocalTrainingWorker(QThread):
 
             model_dir = TRAINED_MODELS_DIR / self.model_name
             model_dir.mkdir(parents=True, exist_ok=True)
-            file_list_json = model_dir / "input_file_list.json"
-            file_list_json.write_text(json.dumps(self.audio_files, ensure_ascii=False), encoding="utf-8")
-
             runner_py = BASE_DIR / "vocal_trainer_runner.py"
             cmd = [
                 get_python_exe(),
@@ -522,8 +525,15 @@ class VocalTrainingWorker(QThread):
                 "--preset", self.preset,
                 "--genre-filter", self.genre_filter,
                 "--output-dir", str(TRAINED_MODELS_DIR),
-                "--file-list", str(file_list_json)
+                "--mode", self.mode,
+                "--gender", self.gender,
             ]
+            if self.mode == "speech":
+                cmd += ["--clips-json", str(self.clips_json)]
+            else:
+                file_list_json = model_dir / "input_file_list.json"
+                file_list_json.write_text(json.dumps(self.audio_files, ensure_ascii=False), encoding="utf-8")
+                cmd += ["--file-list", str(file_list_json)]
 
             self.proc = subprocess.Popen(
                 cmd,
@@ -1246,7 +1256,17 @@ class YunseulLMMStudio(QWidget):
         btn_action_box.addWidget(self.btn_cancel_train)
         left_layout.addLayout(btn_action_box)
 
-        splitter.addWidget(left_pane)
+        self.voice_clone_pane = VoiceClonePane(TRAINED_MODELS_DIR / "_inbox", self)
+        self.voice_clone_pane.train_requested.connect(self.start_voice_clone_training)
+        train_modes = QTabWidget()
+        train_modes.setStyleSheet(
+            "QTabWidget::pane { border: 1px solid #1e293b; border-radius: 8px; }"
+            "QTabBar::tab { background: #1e293b; color: #94a3b8; padding: 8px 14px; border-radius: 6px; margin-right: 4px; }"
+            "QTabBar::tab:selected { background: #0ea5e9; color: white; font-weight: bold; }"
+        )
+        train_modes.addTab(left_pane, "가수 노래로 학습")
+        train_modes.addTab(self.voice_clone_pane, "내 목소리 따라 읽기")
+        splitter.addWidget(train_modes)
 
         # --- 오른쪽 패널: 진행 게이지 & 실시간 터미널 로그 ---
         right_pane = QWidget()
@@ -2007,6 +2027,41 @@ class YunseulLMMStudio(QWidget):
         self.train_worker.sig_finished.connect(self.on_train_finished)
         self.train_worker.start()
 
+    def start_voice_clone_training(self, alias, gender, clips):
+        ok, vram_msg = self.check_vram_for_task("train")
+        if not ok:
+            QMessageBox.warning(self, "VRAM 부족 - 학습 불가", vram_msg)
+            return
+        model_dir = TRAINED_MODELS_DIR / alias
+        if (model_dir / "meta.json").exists():
+            if QMessageBox.question(self, "별칭 덮어쓰기",
+                                    f"'{alias}' 목소리가 이미 있습니다. 새로 학습해 덮을까요?") \
+                    != QMessageBox.StandardButton.Yes:
+                return
+        model_dir.mkdir(parents=True, exist_ok=True)
+        clips_json = model_dir / "clips.json"
+        clips_json.write_text(json.dumps({"gender": gender, "clips": clips}, ensure_ascii=False, indent=2),
+                              encoding="utf-8")
+
+        self.btn_start_train.setEnabled(False)
+        self.voice_clone_pane.set_busy(True)
+        self.btn_cancel_train.show()
+        self.btn_cancel_train.setEnabled(True)
+        self.pbar_train.setValue(0)
+        self.lbl_train_stage_status.setText(f"⏳ '{alias}' 목소리 학습 준비 중...")
+        self.train_start_ts = time.time()
+        self.train_eta_sec = 0.0
+        self.train_target_time_str = ""
+        self.train_timer.start(1000)
+
+        self.train_worker = VocalTrainingWorker(
+            alias, [], preset=self.combo_train_preset.currentData() or "standard",
+            mode="speech", clips_json=str(clips_json), gender=gender)
+        self.train_worker.sig_progress.connect(self.on_train_progress)
+        self.train_worker.sig_log.connect(self.on_train_log)
+        self.train_worker.sig_finished.connect(self.on_train_finished)
+        self.train_worker.start()
+
     def cancel_vocal_training(self):
         if self.train_worker and self.train_worker.isRunning():
             self.btn_cancel_train.setEnabled(False)
@@ -2050,6 +2105,8 @@ class YunseulLMMStudio(QWidget):
         self.train_timer.stop()
         self.btn_start_train.setEnabled(True)
         self.btn_start_train.setText("🚀 5단계 올인원 자동 학습 시작")
+        if hasattr(self, "voice_clone_pane"):
+            self.voice_clone_pane.set_busy(False)
         self.btn_cancel_train.hide()
 
         total_elapsed = int(time.time() - self.train_start_ts) if self.train_start_ts else 0
@@ -2062,21 +2119,28 @@ class YunseulLMMStudio(QWidget):
             self.lbl_train_time_info.setText(f"⏱️ 총 소요: {elapsed_str} | ✅ 모델 등록 완료")
             self.refresh_vocal_models()
             info = ""
+            kind = "song_lora"
             try:
                 meta = json.loads((TRAINED_MODELS_DIR / model_name / "meta.json").read_text(encoding="utf-8"))
-                info = (f"• 학습 곡 수: {meta.get('songs_count')}곡 (가사 포함 {meta.get('songs_with_lyrics')}곡)\n"
-                        f"• {meta.get('epochs')} epoch / 최종 loss {meta.get('final_loss')}\n"
-                        f"• 노래 생성 시 트리거 태그 '{meta.get('trigger_tag')}' 가 캡션 앞에 자동으로 붙습니다.\n")
+                kind = meta.get("kind") or "song_lora"
+                if kind == "speech_clone":
+                    info = (f"• 녹음 문장: {meta.get('clips_count')}개\n"
+                            f"• {meta.get('epochs')} epoch / 최종 loss {meta.get('final_loss')}\n"
+                            f"• 노래 만들기에서 별칭 '{model_name}' 을 고르면 이 목소리로 부릅니다.\n")
+                else:
+                    info = (f"• 학습 곡 수: {meta.get('songs_count')}곡 (가사 포함 {meta.get('songs_with_lyrics')}곡)\n"
+                            f"• {meta.get('epochs')} epoch / 최종 loss {meta.get('final_loss')}\n"
+                            f"• 노래 생성 시 트리거 태그 '{meta.get('trigger_tag')}' 가 캡션 앞에 자동으로 붙습니다.\n")
             except Exception:
                 pass
+            title = "내 목소리 학습 완료" if kind == "speech_clone" else "보컬 학습 완료"
+            body = (f"'{model_name}' 학습이 완료되었습니다.\n\n"
+                    f"• 총 소요 시간: {elapsed_str}\n"
+                    f"• 저장 폴더: trained_vocal_models/{model_name}/\n"
+                    f"{info}\n"
+                    f"지금 [노래 만들기]에서 이 목소리로 노래를 만들어 보시겠습니까?")
             reply = QMessageBox.information(
-                self,
-                "보컬 학습 완료",
-                f"'{model_name}' 보컬/스타일 LoRA 학습이 완료되었습니다.\n\n"
-                f"• 총 소요 시간: {elapsed_str}\n"
-                f"• 저장 폴더: trained_vocal_models/{model_name}/lora/final\n"
-                f"{info}\n"
-                f"지금 [보컬 음악 스튜디오]로 이동하여 이 보컬로 노래를 만들어 보시겠습니까?",
+                self, title, body,
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
             )
             if reply == QMessageBox.StandardButton.Yes:
