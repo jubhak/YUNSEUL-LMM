@@ -1161,6 +1161,13 @@ class SongStudio(QWidget):
             self.slider_seek.setValue(pos)
         self.lbl_time.setText(f"{_fmt_time(pos / 1000)} / {_fmt_time(self.player.duration() / 1000)}")
 
+    def finalize_selected(self):
+        p = self._selected_path()
+        if not p:
+            return
+        meta = self._load_meta(p)
+        self._start_finalize(str(p), meta)
+
     def reuse_selected(self):
         p = self._selected_path()
         if not p:

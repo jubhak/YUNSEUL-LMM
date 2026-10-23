@@ -25,7 +25,8 @@ from PyQt6.QtWidgets import (
     QLabel, QPushButton, QFrame, QSystemTrayIcon, QMenu,
     QGraphicsDropShadowEffect, QDialog, QLineEdit, QTabWidget,
     QTextEdit, QComboBox, QSlider, QProgressBar, QFileDialog,
-    QMessageBox, QCheckBox, QListWidget, QListWidgetItem, QSplitter
+    QMessageBox, QCheckBox, QListWidget, QListWidgetItem, QSplitter,
+    QSpinBox
 )
 from PyQt6.QtCore import Qt, QTimer, QPoint, pyqtSignal, QThread
 from PyQt6.QtGui import QFont, QColor, QIcon, QPixmap, QCursor, QAction, QIntValidator
