@@ -344,6 +344,9 @@ def save_ebook_auto_increment(title: str, markdown_content: str, books_dir: Path
 # =============================================================================
 # 집필 엔진
 # =============================================================================
+import ebook_persona  # noqa: E402  (장르 페르소나 + 장편 구조. 근거: Nature 2023 role-play,
+                      #  IEEE Access 2026 programmable personas, Re3 EMNLP 2022, DOC ACL 2023)
+
 from text_engine import (  # noqa: E402
     GenerationCancelled, RepetitionGuard, is_list_block, ollama_generate, paragraph_issues,
     split_sentences,
@@ -408,7 +411,9 @@ class EbookWriter:
     """
 
     def __init__(self, topic: str, model: str = "qwen3:14b", port: int = 11434, mode: str = "full",
-                 log=print, on_progress=None, on_chapter=None, cancel_check=None):
+                 log=print, on_progress=None, on_chapter=None, cancel_check=None,
+                 genre: str = "", extra_persona: str = "", total_pages: int = 0,
+                 revise: bool = True):
         self.topic = topic
         self.model = model
         self.port = port
@@ -420,14 +425,35 @@ class EbookWriter:
         self.guard = RepetitionGuard()
         self.ledger = []
         self.partial_text = ""
-        self.stats = {"dup_sentences_removed": 0, "paragraphs_rewritten": 0}
+        self.stats = {"dup_sentences_removed": 0, "paragraphs_rewritten": 0,
+                      "sections_revised": 0}
+        # --- 장르 페르소나 / 장편 구조 -------------------------------------
+        self.genre = genre if genre in ebook_persona.GENRES else ""
+        self.extra_persona = extra_persona or ""
+        self.total_pages = max(0, int(total_pages or 0))
+        self.revise = bool(revise)
+        self.persona_system = (ebook_persona.persona_system(self.genre, self.extra_persona)
+                               if self.genre else "")
+        self.state = ebook_persona.StoryState()
+        self.outline = {}
 
-    def _gen(self, prompt, system=WRITER_SYSTEM, **kw):
-        return ollama_generate(prompt, model=self.model, port=self.port, system=system,
+    def _system(self, base=None) -> str:
+        """장르 페르소나(6축) + 기존 문체 규칙."""
+        base = base or WRITER_SYSTEM
+        if not self.persona_system:
+            return base
+        return self.persona_system + "\n\n" + base
+
+    def _gen(self, prompt, system=None, **kw):
+        return ollama_generate(prompt, model=self.model, port=self.port,
+                               system=system or self._system(),
                                cancel_check=self.cancel_check, **kw)
 
     # ------------------------------------------------------------------ 기획
     def plan(self) -> dict:
+        # 장편(수십~300쪽) 모드: 장르 비트 기반 상세 아웃라인 (DOC ACL 2023)
+        if self.genre and self.total_pages >= 40:
+            return self._plan_long()
         n_ch, n_sec, _ = MODE_SPEC[self.mode]
         if self.mode == "full":
             shape = ("프롤로그, 제1장~제5장, 에필로그 순서의 7개 챕터. "
@@ -594,6 +620,103 @@ class EbookWriter:
             if s.startswith(("-", "•", "*")):
                 self.ledger.append(f"- [{sec_title}] {s.lstrip('-•* ').strip()}")
 
+    # ------------------------------------------------------------------ 장편
+    def _plan_long(self) -> dict:
+        """plan_chapters 로 골격을 잡고, LLM 으로 장별 상세 아웃라인을 채운다."""
+        plan0 = ebook_persona.plan_chapters(self.total_pages, self.genre)
+        self.on_progress(f"기획: {plan0['total_pages']}쪽 / {len(plan0['chapters'])}장 아웃라인...", 0, 1, 0)
+        prompt = ebook_persona.outline_prompt(self.topic, self.genre, self.total_pages,
+                                              self.extra_persona)
+        raw = self._gen(prompt, max_tokens=7000)
+        got = _parse_json_block(raw) or {}
+        chs = got.get("chapters") or []
+        outline = {"book_title": got.get("title") or self.topic,
+                   "logline": got.get("logline", ""), "chapters": []}
+        seed = got.get("state_seed") or {}
+        for k in ("characters", "places", "items"):
+            for name, desc in (seed.get(k) or {}).items():
+                getattr(self.state, k)[str(name)] = str(desc)
+        for t in seed.get("open_threads") or []:
+            self.state.open_threads.append(str(t))
+
+        # 아웃라인이 부족하면 plan_chapters 골격으로 패딩 (중단 금지)
+        for i, base in enumerate(plan0["chapters"]):
+            src = chs[i] if i < len(chs) else {}
+            secs_src = src.get("sections") or []
+            sections = []
+            for j, bsec in enumerate(base["sections"]):
+                ss = secs_src[j] if j < len(secs_src) else {}
+                sections.append({
+                    "title": str(ss.get("title") or bsec["title"]),
+                    "beats": ss.get("beats") or bsec["beats"],
+                    "target_chars": int(ss.get("target_chars") or bsec["target_chars"]),
+                })
+            if secs_src and len(secs_src) > len(sections):
+                for extra in secs_src[len(sections):]:
+                    sections.append({"title": str(extra.get("title") or "이어서"),
+                                     "beats": extra.get("beats") or [],
+                                     "target_chars": int(extra.get("target_chars") or 1400)})
+            outline["chapters"].append({
+                "title": str(src.get("title") or base["title"]),
+                "pages": int(src.get("pages") or base["pages"]),
+                "state_change": str(src.get("state_change") or ""),
+                "sections": sections,
+            })
+        self.outline = outline
+        return outline
+
+    def _revision(self, body: str, ch_title: str = "") -> str:
+        """Re3 revision 패스: 새로 쓰지 않고 충돌·반복·문체 위반만 고친다.
+
+        근거: Yang et al., Re3 (EMNLP 2022) - 계획 고정 + 수정 패스.
+              DOC (ACL 2023) - 상세 아웃라인 대비 장 단위 점검.
+        """
+        if not (self.revise and len(body) > 400):
+            return body
+        try:
+            fixed = self._gen(
+                ebook_persona.revision_prompt(body, self.state.to_prompt(), self.genre or "economy"),
+                system=self._system(),
+                temperature=0.35,
+                max_tokens=int(len(body) * 2.2) + 400,
+            )
+        except Exception:
+            return body
+        fixed = (fixed or "").strip()
+        # 수정본이 원문의 55% 미만이면 잘린 것이므로 버린다(정보 손실 방지)
+        if len(fixed) < len(body) * 0.55:
+            return body
+        self.stats["sections_revised"] += 1
+        return fixed
+
+    def _update_state(self, body: str) -> None:
+        """장 단위 이야기 상태 갱신 (Narrative State Tracking, arXiv 2026)."""
+        if not self.genre:
+            return
+        try:
+            raw = self._gen(ebook_persona.state_update_prompt(body, self.state.to_prompt()),
+                            system=self._system(), temperature=0.2, max_tokens=800)
+        except Exception:
+            return
+        got = _parse_json_block(raw) or {}
+        for k in ("characters", "places", "items"):
+            for name, desc in (got.get(k) or {}).items():
+                self.state.__dict__[k].setdefault(str(name), str(desc))
+        for t in got.get("timeline") or []:
+            self.state.timeline.append(str(t))
+        for t in got.get("open_threads") or []:
+            t = str(t)
+            if t and t not in self.state.open_threads:
+                self.state.open_threads.append(t)
+        for t in got.get("resolved") or []:
+            t = str(t)
+            if t and t not in self.state.resolved:
+                self.state.resolved.append(t)
+
+    def consistency(self, chapters: list) -> dict:
+        """모델 없이 도는 최종 일관성 점검(로컬)."""
+        return ebook_persona.consistency_report(chapters, self.state)
+
     def write_section(self, plan, ch, sec_idx, tail, target_chars) -> str:
         sec = ch["sections"][sec_idx]
         next_title = ch["sections"][sec_idx + 1]["title"] if sec_idx + 1 < len(ch["sections"]) else ""
@@ -620,6 +743,8 @@ class EbookWriter:
 
     def write(self) -> str:
         _, _, target_chars = MODE_SPEC[self.mode]
+        long_mode = bool(self.genre and self.total_pages >= 40)
+        self._bodies = []
         self.on_progress("기획: 챕터와 소제목, 장별 사례 배정 중...", 0, 1, 0)
         plan = self.plan()
         chapters = plan["chapters"]
@@ -642,7 +767,11 @@ class EbookWriter:
             for si, sec in enumerate(ch["sections"]):
                 self.on_progress(f"[{step + 1}/{total_steps}] {ch['title']} > {sec['title']} 집필 중...",
                                  step, total_steps, len(full + ch_md))
-                body = self.write_section(plan, ch, si, tail, target_chars)
+                sec_chars = int(sec.get("target_chars") or target_chars)
+                body = self.write_section(plan, ch, si, tail, sec_chars)
+                if long_mode and self.revise:
+                    body = self._revision(body, ch["title"])
+                self._bodies.append(body)
                 ch_md += f"\n### {sec['title']}\n\n{body}\n"
                 tail = body[-300:]
                 step += 1
@@ -652,10 +781,20 @@ class EbookWriter:
             self.partial_text = full
             self.on_chapter(ch["title"], ch_md, full)
             self.log(f"   ✓ '{ch['title']}' 완료 ({len(ch_md):,}자)")
+            if long_mode:
+                self._update_state(ch_md)
 
         self.on_progress("집필 완료", total_steps, total_steps, len(full))
         self.log(f"🧹 중복 문장 {self.stats['dup_sentences_removed']}개 제거, "
-                 f"반복 문단 {self.stats['paragraphs_rewritten']}개 윤문")
+                 f"반복 문단 {self.stats['paragraphs_rewritten']}개 윤문, "
+                 f"수정 패스 {self.stats['sections_revised']}회")
+        if long_mode:
+            rep = self.consistency(getattr(self, "_bodies", []))
+            self.consistency_report = rep
+            for issue in rep["issues"]:
+                self.log(f"   ⚠️ 일관성: {issue}")
+            if not rep["issues"]:
+                self.log("   ✓ 일관성 점검 통과 (표기 흔들림/미회수 복선 없음)")
         return full
 
 

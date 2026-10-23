@@ -66,9 +66,11 @@ TRAINED_MODELS_DIR.mkdir(parents=True, exist_ok=True)
 ACESTEP_PY = BASE_DIR / "audio_engines" / "venv_acestep" / "Scripts" / "python.exe"
 
 from ebook_writer import save_ebook_auto_increment, markdown_to_book_html, EbookWriter
+import ebook_persona  # 장르 페르소나(6축) + 장편 구조. Shanahan Nature 2023 / Li IEEE Access 2026 /
+                      # Re3 EMNLP 2022 / DOC ACL 2023 / Narrative State Tracking arXiv 2026
 from text_engine import GenerationCancelled, ollama_generate
 from song_studio import SongStudio
-from voice_clone_pane import VoiceClonePane
+from voice_record_studio import VoiceRecordStudio
 
 def get_python_exe():
     if getattr(sys, "frozen", False):
@@ -376,12 +378,17 @@ class FullEBookWorker(QThread):
     sig_chapter_done = pyqtSignal(str, str, str)  # ch_title, ch_content, full_accumulated_text
     sig_finished = pyqtSignal(bool, str, str)      # ok, full_text, err_msg
 
-    def __init__(self, port, model, topic, mode="full"):
+    def __init__(self, port, model, topic, mode="full", genre="", extra_persona="",
+                 total_pages=0, revise=True):
         super().__init__()
         self.port = port
         self.model = model
         self.topic = topic
         self.mode = mode  # "full", "chapter", "summary"
+        self.genre = genre              # ebook_persona.GENRES 키 (빈값 = 기존 동작)
+        self.extra_persona = extra_persona
+        self.total_pages = total_pages  # 0 = 기존 모드 분량, 40+ = 장편 모드
+        self.revise = revise
         self._is_cancelled = False
         self.start_time = None
 
@@ -402,6 +409,8 @@ class FullEBookWorker(QThread):
 
         writer = EbookWriter(
             self.topic, model=self.model, port=self.port, mode=self.mode,
+            genre=self.genre, extra_persona=self.extra_persona,
+            total_pages=self.total_pages, revise=self.revise,
             log=lambda *_: None,
             on_progress=on_progress,
             on_chapter=lambda title, ch_md, full: self.sig_chapter_done.emit(title, ch_md, full),
@@ -473,16 +482,12 @@ class VocalTrainingWorker(QThread):
     sig_log = pyqtSignal(str)
     sig_finished = pyqtSignal(bool, str, str)
 
-    def __init__(self, model_name, audio_files, preset="standard", genre_filter="kpop_ballad",
-                 mode="songs", clips_json=None, gender="female"):
+    def __init__(self, model_name, audio_files, preset="standard", genre_filter="kpop_ballad"):
         super().__init__()
         self.model_name = re.sub(r'[^\w\s-]', '', model_name).strip() or "CustomSinger"
         self.audio_files = [str(Path(p).resolve()) for p in audio_files if Path(p).exists()]
         self.preset = preset
         self.genre_filter = genre_filter
-        self.mode = mode
-        self.clips_json = clips_json
-        self.gender = gender
         self._is_cancelled = False
         self.proc = None
         self.start_time = None
@@ -507,8 +512,7 @@ class VocalTrainingWorker(QThread):
         self.start_time = time.time()
         try:
             # 0. VRAM 중재 (Ollama LLM 언로드)
-            kind = "내 목소리 따라 읽기" if self.mode == "speech" else "5단계 올인원 보컬 AI"
-            self.sig_log.emit(f"🚀 [{self.model_name}] {kind} 학습 파이프라인 가동...")
+            self.sig_log.emit(f"🚀 [{self.model_name}] 5단계 올인원 보컬 AI 학습 파이프라인 가동...")
             self.sig_log.emit("• [VRAM 관리자] 학습을 위한 GPU VRAM(16GB) 전용 공간 확보 중...")
             subprocess.run(["ollama", "stop", "qwen3:14b"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=CREATE_NO_WINDOW)
             time.sleep(1.0)
@@ -517,6 +521,9 @@ class VocalTrainingWorker(QThread):
 
             model_dir = TRAINED_MODELS_DIR / self.model_name
             model_dir.mkdir(parents=True, exist_ok=True)
+            file_list_json = model_dir / "input_file_list.json"
+            file_list_json.write_text(json.dumps(self.audio_files, ensure_ascii=False), encoding="utf-8")
+
             runner_py = BASE_DIR / "vocal_trainer_runner.py"
             cmd = [
                 get_python_exe(),
@@ -525,15 +532,8 @@ class VocalTrainingWorker(QThread):
                 "--preset", self.preset,
                 "--genre-filter", self.genre_filter,
                 "--output-dir", str(TRAINED_MODELS_DIR),
-                "--mode", self.mode,
-                "--gender", self.gender,
+                "--file-list", str(file_list_json)
             ]
-            if self.mode == "speech":
-                cmd += ["--clips-json", str(self.clips_json)]
-            else:
-                file_list_json = model_dir / "input_file_list.json"
-                file_list_json.write_text(json.dumps(self.audio_files, ensure_ascii=False), encoding="utf-8")
-                cmd += ["--file-list", str(file_list_json)]
 
             self.proc = subprocess.Popen(
                 cmd,
@@ -727,6 +727,10 @@ class YunseulLMMStudio(QWidget):
         # 탭 4: 보컬 음악 스튜디오
         self.tab_music = SongStudio(self, BASE_DIR, BATCH_OUT / "songs", TRAINED_MODELS_DIR, ACESTEP_PY)
         self.tabs.addTab(self.tab_music, "🎵 노래 만들기")
+
+        # 탭 4-1: 내 목소리 녹음(따라 읽기) → 내 목소리로 노래
+        self.tab_record = VoiceRecordStudio(self, BASE_DIR, TRAINED_MODELS_DIR, ACESTEP_PY)
+        self.tabs.addTab(self.tab_record, "🎙️ 내 목소리 녹음")
 
         # 탭 5: 보컬 학습 스튜디오
         self.tab_train = self.create_train_tab()
@@ -924,6 +928,46 @@ class YunseulLMMStudio(QWidget):
         ])
         self.combo_length.setStyleSheet("background-color: #1e293b; color: white; border: 1px solid #334155; border-radius: 6px; padding: 5px;")
         top_bar.addWidget(self.combo_length)
+
+        # ---- 2행: 장르 페르소나 · 분량(쪽) · 외부 페르소나 ----------------
+        row2 = QHBoxLayout()
+        row2.addWidget(QLabel("장르:"))
+        self.combo_ebook_genre = QComboBox()
+        for label, key in ebook_persona.genre_options():
+            self.combo_ebook_genre.addItem(label, key)
+        self.combo_ebook_genre.setStyleSheet("background-color: #1e293b; color: white; border: 1px solid #334155; border-radius: 6px; padding: 5px;")
+        self.combo_ebook_genre.setToolTip(
+            "장르를 고르면 6축 페르소나(정체성·시대·가치관·문체·금기·독자약속)와\n"
+            "장 필수 비트가 집필 전체에 적용됩니다.\n"
+            "근거: Shanahan et al., Nature 2023 (role play) / Li et al., IEEE Access 2026")
+        self.combo_ebook_genre.currentIndexChanged.connect(self._on_ebook_genre_changed)
+        row2.addWidget(self.combo_ebook_genre)
+
+        row2.addWidget(QLabel("목표 쪽수:"))
+        self.spin_ebook_pages = QSpinBox()
+        self.spin_ebook_pages.setRange(0, 400)
+        self.spin_ebook_pages.setSingleStep(10)
+        self.spin_ebook_pages.setValue(0)
+        self.spin_ebook_pages.setSuffix(" 쪽")
+        self.spin_ebook_pages.setSpecialValueText("기본 분량")
+        self.spin_ebook_pages.setStyleSheet("background-color: #1e293b; color: white; border: 1px solid #334155; border-radius: 6px; padding: 4px;")
+        self.spin_ebook_pages.setToolTip(
+            "40쪽 이상이면 장편 모드: 상세 아웃라인 → 장별 집필 → 수정 패스 → 일관성 점검.\n"
+            "쪽당 약 450자 환산 (300쪽 ≈ 13만 5천 자)")
+        row2.addWidget(self.spin_ebook_pages)
+
+        row2.addWidget(QLabel("외부 페르소나:"))
+        self.edit_ebook_persona = QLineEdit()
+        self.edit_ebook_persona.setPlaceholderText(
+            "예: 30년차 과학 저널리스트. 냉소적 유머, 1인칭 금지, 모든 주장에 반례를 붙인다")
+        self.edit_ebook_persona.setStyleSheet("background-color: #1e293b; color: white; border: 1px solid #334155; border-radius: 6px; padding: 6px 10px;")
+        self.edit_ebook_persona.setToolTip("장르 프리셋 위에 덧씌우는 나만의 페르소나 지시(우선 적용)")
+        row2.addWidget(self.edit_ebook_persona, 1)
+        layout.addLayout(row2)
+        self.lbl_ebook_persona = QLabel("")
+        self.lbl_ebook_persona.setStyleSheet("color: #7dd3fc; font-size: 11px;")
+        self.lbl_ebook_persona.setWordWrap(True)
+        layout.addWidget(self.lbl_ebook_persona)
 
         self.btn_write_ebook = QPushButton("✨ 전자책 집필 시작")
         self.btn_write_ebook.setStyleSheet("background-color: #0284c7; color: white; font-weight: bold; border-radius: 6px; padding: 7px 16px;")
@@ -1256,17 +1300,7 @@ class YunseulLMMStudio(QWidget):
         btn_action_box.addWidget(self.btn_cancel_train)
         left_layout.addLayout(btn_action_box)
 
-        self.voice_clone_pane = VoiceClonePane(TRAINED_MODELS_DIR / "_inbox", self)
-        self.voice_clone_pane.train_requested.connect(self.start_voice_clone_training)
-        train_modes = QTabWidget()
-        train_modes.setStyleSheet(
-            "QTabWidget::pane { border: 1px solid #1e293b; border-radius: 8px; }"
-            "QTabBar::tab { background: #1e293b; color: #94a3b8; padding: 8px 14px; border-radius: 6px; margin-right: 4px; }"
-            "QTabBar::tab:selected { background: #0ea5e9; color: white; font-weight: bold; }"
-        )
-        train_modes.addTab(left_pane, "가수 노래로 학습")
-        train_modes.addTab(self.voice_clone_pane, "내 목소리 따라 읽기")
-        splitter.addWidget(train_modes)
+        splitter.addWidget(left_pane)
 
         # --- 오른쪽 패널: 진행 게이지 & 실시간 터미널 로그 ---
         right_pane = QWidget()
@@ -1619,6 +1653,14 @@ class YunseulLMMStudio(QWidget):
     # -------------------------------------------------------------------------
     # Actions: eBook Generation
     # -------------------------------------------------------------------------
+    def _on_ebook_genre_changed(self):
+        key = self.combo_ebook_genre.currentData()
+        d = ebook_persona.persona_dict(key)
+        self.lbl_ebook_persona.setText(
+            f"🧑‍🎨 페르소나: {d['name']} · {d['role']} / 시대: {d['era']} / "
+            f"가치관: {d['values']} / 문체: {d['voice']} / 금기: {d['taboo']} / "
+            f"장 비트: {' → '.join(d['beats'])}")
+
     def start_ebook_generation(self):
         if not self.is_server_alive():
             QMessageBox.warning(self, "서버 미실행", "Ollama 서버가 정지되어 있습니다. 먼저 [서버 시작] 버튼을 눌러주세요.")
@@ -1660,8 +1702,15 @@ class YunseulLMMStudio(QWidget):
         self.ebook_target_time_str = ""
         self.ebook_timer.start(1000)
 
+        genre = self.combo_ebook_genre.currentData() or ""
+        extra_persona = self.edit_ebook_persona.text().strip()
+        total_pages = int(self.spin_ebook_pages.value() or 0)
+        if total_pages >= 40:
+            mode = "long"
         model = self.cfg.get("text_model", "qwen3:14b")
-        self.ebook_worker = FullEBookWorker(self.port, model, topic, mode)
+        self.ebook_worker = FullEBookWorker(self.port, model, topic, mode,
+                                            genre=genre, extra_persona=extra_persona,
+                                            total_pages=total_pages)
         self.ebook_worker.sig_progress.connect(self.on_ebook_progress)
         self.ebook_worker.sig_chapter_done.connect(self.on_ebook_chapter_done)
         self.ebook_worker.sig_finished.connect(self.on_ebook_finished)
@@ -2027,41 +2076,6 @@ class YunseulLMMStudio(QWidget):
         self.train_worker.sig_finished.connect(self.on_train_finished)
         self.train_worker.start()
 
-    def start_voice_clone_training(self, alias, gender, clips):
-        ok, vram_msg = self.check_vram_for_task("train")
-        if not ok:
-            QMessageBox.warning(self, "VRAM 부족 - 학습 불가", vram_msg)
-            return
-        model_dir = TRAINED_MODELS_DIR / alias
-        if (model_dir / "meta.json").exists():
-            if QMessageBox.question(self, "별칭 덮어쓰기",
-                                    f"'{alias}' 목소리가 이미 있습니다. 새로 학습해 덮을까요?") \
-                    != QMessageBox.StandardButton.Yes:
-                return
-        model_dir.mkdir(parents=True, exist_ok=True)
-        clips_json = model_dir / "clips.json"
-        clips_json.write_text(json.dumps({"gender": gender, "clips": clips}, ensure_ascii=False, indent=2),
-                              encoding="utf-8")
-
-        self.btn_start_train.setEnabled(False)
-        self.voice_clone_pane.set_busy(True)
-        self.btn_cancel_train.show()
-        self.btn_cancel_train.setEnabled(True)
-        self.pbar_train.setValue(0)
-        self.lbl_train_stage_status.setText(f"⏳ '{alias}' 목소리 학습 준비 중...")
-        self.train_start_ts = time.time()
-        self.train_eta_sec = 0.0
-        self.train_target_time_str = ""
-        self.train_timer.start(1000)
-
-        self.train_worker = VocalTrainingWorker(
-            alias, [], preset=self.combo_train_preset.currentData() or "standard",
-            mode="speech", clips_json=str(clips_json), gender=gender)
-        self.train_worker.sig_progress.connect(self.on_train_progress)
-        self.train_worker.sig_log.connect(self.on_train_log)
-        self.train_worker.sig_finished.connect(self.on_train_finished)
-        self.train_worker.start()
-
     def cancel_vocal_training(self):
         if self.train_worker and self.train_worker.isRunning():
             self.btn_cancel_train.setEnabled(False)
@@ -2105,8 +2119,6 @@ class YunseulLMMStudio(QWidget):
         self.train_timer.stop()
         self.btn_start_train.setEnabled(True)
         self.btn_start_train.setText("🚀 5단계 올인원 자동 학습 시작")
-        if hasattr(self, "voice_clone_pane"):
-            self.voice_clone_pane.set_busy(False)
         self.btn_cancel_train.hide()
 
         total_elapsed = int(time.time() - self.train_start_ts) if self.train_start_ts else 0
@@ -2119,33 +2131,26 @@ class YunseulLMMStudio(QWidget):
             self.lbl_train_time_info.setText(f"⏱️ 총 소요: {elapsed_str} | ✅ 모델 등록 완료")
             self.refresh_vocal_models()
             info = ""
-            kind = "song_lora"
             try:
                 meta = json.loads((TRAINED_MODELS_DIR / model_name / "meta.json").read_text(encoding="utf-8"))
-                kind = meta.get("kind") or "song_lora"
-                if kind == "speech_clone":
-                    info = (f"• 녹음 문장: {meta.get('clips_count')}개\n"
-                            f"• {meta.get('epochs')} epoch / 최종 loss {meta.get('final_loss')}\n"
-                            f"• 노래 만들기에서 별칭 '{model_name}' 을 고르면 이 목소리로 부릅니다.\n")
-                else:
-                    info = (f"• 학습 곡 수: {meta.get('songs_count')}곡 (가사 포함 {meta.get('songs_with_lyrics')}곡)\n"
-                            f"• {meta.get('epochs')} epoch / 최종 loss {meta.get('final_loss')}\n"
-                            f"• 노래 생성 시 트리거 태그 '{meta.get('trigger_tag')}' 가 캡션 앞에 자동으로 붙습니다.\n")
+                info = (f"• 학습 곡 수: {meta.get('songs_count')}곡 (가사 포함 {meta.get('songs_with_lyrics')}곡)\n"
+                        f"• {meta.get('epochs')} epoch / 최종 loss {meta.get('final_loss')}\n"
+                        f"• 노래 생성 시 트리거 태그 '{meta.get('trigger_tag')}' 가 캡션 앞에 자동으로 붙습니다.\n")
             except Exception:
                 pass
-            title = "내 목소리 학습 완료" if kind == "speech_clone" else "보컬 학습 완료"
-            body = (f"'{model_name}' 학습이 완료되었습니다.\n\n"
-                    f"• 총 소요 시간: {elapsed_str}\n"
-                    f"• 저장 폴더: trained_vocal_models/{model_name}/\n"
-                    f"{info}\n"
-                    f"지금 [노래 만들기]에서 이 목소리로 노래를 만들어 보시겠습니까?")
             reply = QMessageBox.information(
-                self, title, body,
+                self,
+                "보컬 학습 완료",
+                f"'{model_name}' 보컬/스타일 LoRA 학습이 완료되었습니다.\n\n"
+                f"• 총 소요 시간: {elapsed_str}\n"
+                f"• 저장 폴더: trained_vocal_models/{model_name}/lora/final\n"
+                f"{info}\n"
+                f"지금 [보컬 음악 스튜디오]로 이동하여 이 보컬로 노래를 만들어 보시겠습니까?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
             )
             if reply == QMessageBox.StandardButton.Yes:
                 self.tabs.setCurrentWidget(self.tab_music)
-                combo = self.tab_music.combo_voice if kind == "speech_clone" else self.tab_music.combo_model
+                combo = self.tab_music.combo_voice
                 for i in range(combo.count()):
                     if model_name in combo.itemText(i):
                         combo.setCurrentIndex(i)

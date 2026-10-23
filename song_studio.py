@@ -10,27 +10,34 @@ import json
 import os
 import re
 import subprocess
+import sys
 import time
 import urllib.request
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QThread, QTimer, QUrl, pyqtSignal
-from PyQt6.QtGui import QPixmap
 from PyQt6.QtMultimedia import QMediaPlayer
 from PyQt6.QtWidgets import (
-    QButtonGroup, QComboBox, QFileDialog, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
+    QButtonGroup, QCheckBox, QComboBox, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
     QScrollArea, QSlider, QTextEdit, QVBoxLayout, QWidget,
 )
-
-from mp3_meta import embed_mp3_meta, read_cover_bytes
 
 from lyrics_writer import (
     GENRE_LYRIC_GUIDE, GENRE_MENU, MOOD_CAPTION, build_caption, count_syllables,
     estimate_duration_sec, generate_lyrics, get_guide,
 )
+import voice_catalog
+
+SINGER_STYLES = [("발라드 · 애절하게", "ballad"), ("파워 · 힘있게", "power"),
+                 ("아이돌 · 밝고 또렷하게", "idol"), ("자연스럽게", "natural")]
 
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+
+BASE_DIR = Path(__file__).resolve().parent
+FINALIZE_SCRIPT = BASE_DIR / "song_finalize.py"
+POLISH_OPTIONS = [("부드럽게 다듬기 (추천)", "natural"), ("아주 부드럽게", "soft"),
+                  ("풍성하게 (두 테이크 겹침)", "rich"), ("다듬지 않기", "off")]
 
 TEMPO_FACTOR = {"느리게": 0.88, "보통": 1.0, "빠르게": 1.12}
 FORMS = [("짧게 · 1절 + 후렴", 60), ("보통 · 2절 + 후렴 두 번", 120), ("풀버전 · 브릿지 + 마지막 후렴", 180)]
@@ -146,6 +153,57 @@ class LyricsWorker(QThread):
             self.finished.emit(False, "", str(e))
 
 
+class FinalizeWorker(QThread):
+    """song_finalize.py 실행: 내 목소리 음색 변환 → 부드럽게 다듬기 → 가사/커버 태그 → 인트로 영상."""
+    log_line = pyqtSignal(str)
+    finished = pyqtSignal(bool, str, str)      # ok, mp3경로, 오류
+
+    def __init__(self, cmd, cwd):
+        super().__init__()
+        self.cmd = cmd
+        self.cwd = cwd
+        self.proc = None
+
+    def cancel(self):
+        if self.proc and self.proc.poll() is None:
+            try:
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(self.proc.pid)],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               creationflags=CREATE_NO_WINDOW)
+            except Exception:
+                pass
+
+    def run(self):
+        out = None
+        try:
+            for i, a in enumerate(self.cmd):
+                if a == "--output" and i + 1 < len(self.cmd):
+                    out = self.cmd[i + 1]
+            env = os.environ.copy()
+            env["PYTHONIOENCODING"] = "utf-8"
+            self.proc = subprocess.Popen(self.cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                         text=True, encoding="utf-8", errors="replace", env=env,
+                                         cwd=self.cwd, creationflags=CREATE_NO_WINDOW)
+            err = ""
+            for line in self.proc.stdout:
+                line = line.rstrip()
+                if not line:
+                    continue
+                if line.startswith("[LOG] "):
+                    self.log_line.emit(line[6:])
+                elif line.startswith("[ERROR]"):
+                    err = line[7:].strip()
+                elif line.startswith("[DONE:"):
+                    out = line[6:-1]
+            self.proc.wait()
+            if self.proc.returncode != 0:
+                self.finished.emit(False, out or "", err or f"마무리 단계 오류 (exit {self.proc.returncode})")
+                return
+            self.finished.emit(True, out or "", "")
+        except Exception as e:  # noqa: BLE001
+            self.finished.emit(False, out or "", f"{type(e).__name__}: {e}")
+
+
 class SongWorker(QThread):
     """acestep_official_runner.py 를 ACE-Step 전용 파이썬으로 실행하고 진행 단계를 알린다."""
     stage = pyqtSignal(int, int, str)        # 현재 %, 이 단계에서 다가갈 최대 %, 안내 문구
@@ -233,6 +291,8 @@ class SongStudio(QWidget):
         self._pct = 0.0
         self._pct_cap = 0.0
         self._gen_started = 0.0
+        self.finalize_worker = None
+        self._pending_finalize = None
 
         self.setObjectName("studioRoot")
         self.setStyleSheet(STUDIO_CSS)
@@ -305,6 +365,10 @@ class SongStudio(QWidget):
             mood_grid.addWidget(b, i // 4, i % 4)
         lay.addLayout(mood_grid)
 
+        lay.addWidget(_label("보컬", "h2"))
+        self.gender_group, row = self._segmented([("여성", "female"), ("남성", "male")])
+        lay.addLayout(row)
+
         lay.addWidget(_label("템포", "h2"))
         self.tempo_group, row = self._segmented([(k, k) for k in TEMPO_FACTOR], default=1)
         lay.addLayout(row)
@@ -316,34 +380,66 @@ class SongStudio(QWidget):
         self.combo_form.setCurrentIndex(1)
         lay.addWidget(self.combo_form)
 
-        lay.addWidget(_label("목소리 (여성 · 남성 · 별칭)", "h2"))
+        lay.addWidget(_label("목소리", "h2"))
         self.combo_voice = QComboBox()
         self.combo_voice.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
-        self.combo_voice.setToolTip("여성, 남성, 또는 따라 읽어 저장한 별칭 목소리입니다.")
+        self.combo_voice.setToolTip("남성·여성 기본 보컬, 또는 내가 문장을 읽어 학습한 별칭 목소리.\n"
+                                    "1000곡으로 학습한 코퍼스 모델은 아래 [곡 학습 모델]에서 따로 고릅니다.")
         lay.addWidget(self.combo_voice)
-
-        lay.addWidget(_label("학습 모델", "h2"))
-        self.combo_model = QComboBox()
-        self.combo_model.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
-        self.combo_model.setToolTip("가수 노래로 학습한 모델입니다. 목소리 별칭과는 따로 고릅니다.")
-        lay.addWidget(self.combo_model)
-
         vrow = QHBoxLayout()
         self.combo_strength = QComboBox()
-        for label, val in [("반영 100%", 1.0), ("반영 80%", 0.8), ("반영 60%", 0.6), ("반영 120%", 1.2)]:
+        for label, val in [("목소리 반영 100%", 1.0), ("반영 80%", 0.8), ("반영 60%", 0.6), ("반영 120%", 1.2)]:
             self.combo_strength.addItem(label, val)
         self.combo_strength.setToolTip("발음이 뭉개지면 낮추고, 학습한 느낌이 약하면 높이세요.")
         vrow.addWidget(self.combo_strength, 1)
         btn_refresh = QPushButton("🔄")
         btn_refresh.setProperty("class", "ghost")
-        btn_refresh.setToolTip("목소리와 학습 모델 목록 새로고침")
+        btn_refresh.setToolTip("학습한 목소리 목록 새로고침")
         btn_refresh.clicked.connect(self.refresh_voices)
         vrow.addWidget(btn_refresh)
         lay.addLayout(vrow)
         self.lbl_voice_info = _label("", "hint", wrap=True)
         lay.addWidget(self.lbl_voice_info)
         self.combo_voice.currentIndexChanged.connect(self._on_voice_changed)
-        self.combo_model.currentIndexChanged.connect(self._on_voice_changed)
+
+        lay.addWidget(_label("곡 학습 모델 (스타일)", "h2"))
+        self.combo_song_model = QComboBox()
+        self.combo_song_model.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.combo_song_model.setToolTip("1000곡 이상으로 학습한 노래/스타일 LoRA를 '따로' 선택합니다.\n"
+                                         "목소리(남성/여성/내 별칭)와 독립적이며, 둘을 함께 적용할 수 있습니다.")
+        lay.addWidget(self.combo_song_model)
+        smrow = QHBoxLayout()
+        self.combo_song_strength = QComboBox()
+        for label, val in [("스타일 반영 60%", 0.6), ("반영 80%", 0.8), ("반영 100%", 1.0),
+                           ("반영 120%", 1.2)]:
+            self.combo_song_strength.addItem(label, val)
+        self.combo_song_strength.setCurrentIndex(1)
+        self.combo_song_strength.setToolTip("노래 코퍼스 모델은 '창법/편곡 스타일'을 가져옵니다.\n"
+                                            "목소리 정체성이 뭉개지면 낮추세요.")
+        smrow.addWidget(self.combo_song_strength, 1)
+        btn_refresh2 = QPushButton("🔄")
+        btn_refresh2.setProperty("class", "ghost")
+        btn_refresh2.setToolTip("곡 학습 모델 목록 새로고침")
+        btn_refresh2.clicked.connect(self.refresh_voices)
+        smrow.addWidget(btn_refresh2)
+        lay.addLayout(smrow)
+        self.lbl_song_model_info = _label("", "hint", wrap=True)
+        lay.addWidget(self.lbl_song_model_info)
+        self.combo_song_model.currentIndexChanged.connect(self._on_song_model_changed)
+
+        lay.addWidget(_label("가수처럼 부르기", "h2"))
+        self.combo_singer_style = QComboBox()
+        for label, val in SINGER_STYLES:
+            self.combo_singer_style.addItem(label, val)
+        self.combo_singer_style.setToolTip(
+            "비브라토·프레이즈 다이나믹·싱어 포먼트를 적용해 실제 가수처럼 만듭니다.\n"
+            "(VibE-SVC / ICASSP 2022 비브라토 모델링 / Roebel 2012 여기 성분 변조 기반)")
+        lay.addWidget(self.combo_singer_style)
+        self.combo_coach = QComboBox()
+        for label, val in [("다듬기 없이", 0.0), ("살짝", 0.6), ("보통 (추천)", 1.0), ("강하게", 1.3)]:
+            self.combo_coach.addItem(label, val)
+        self.combo_coach.setCurrentIndex(2)
+        lay.addWidget(self.combo_coach)
 
         lay.addWidget(_label("한 번에 만들 버전 수", "h2"))
         self.combo_takes = QComboBox()
@@ -352,6 +448,26 @@ class SongStudio(QWidget):
         self.combo_takes.setCurrentIndex(1)
         self.combo_takes.setToolTip("여러 버전을 만들어 가사가 가장 또렷하게 들리는 것을 자동으로 고릅니다.\n버전이 많을수록 오래 걸립니다.")
         lay.addWidget(self.combo_takes)
+
+        lay.addWidget(_label("보컬 다듬기", "h2"))
+        self.combo_polish = QComboBox()
+        for label, val in POLISH_OPTIONS:
+            self.combo_polish.addItem(label, val)
+        self.combo_polish.setToolTip("레가토·피치 흔들림 보정·리버브·라우드니스 마스터링을 적용합니다.\n"
+                                     "'풍성하게'는 두 번째 테이크를 낮게 겹쳐 두께를 더합니다.")
+        lay.addWidget(self.combo_polish)
+
+        self.chk_lyrics_tag = QCheckBox("mp3 에 가사·동기화 가사 넣기")
+        self.chk_lyrics_tag.setChecked(True)
+        self.chk_lyrics_tag.setToolTip("USLT(가사) + SYLT(줄별 동기화) 태그와 .lrc 파일을 함께 저장합니다.")
+        lay.addWidget(self.chk_lyrics_tag)
+        self.chk_cover = QCheckBox("인트로(커버) 이미지 넣기")
+        self.chk_cover.setChecked(True)
+        self.chk_cover.setToolTip("제목·장르·분위기·실제 파형으로 커버를 그려 앨범 아트로 심습니다.")
+        lay.addWidget(self.chk_cover)
+        self.chk_intro_video = QCheckBox("인트로 영상(mp4)도 만들기")
+        self.chk_intro_video.setToolTip("커버 + 곡으로 페이드인 인트로 영상. ffmpeg 필요.")
+        lay.addWidget(self.chk_intro_video)
 
         lay.addStretch()
         scroll.setWidget(inner)
@@ -508,6 +624,14 @@ class SongStudio(QWidget):
         self.list_songs.itemDoubleClicked.connect(lambda _: self.toggle_play())
         lay.addWidget(self.list_songs, 1)
 
+        self.btn_finalize = QPushButton("🎨 선택한 노래 다시 다듬기 · 가사/커버 입히기")
+        self.btn_finalize.setProperty("class", "ghost")
+        self.btn_finalize.setToolTip("왼쪽 '보컬 다듬기' 설정으로 다시 처리합니다.\n"
+                                     "이미 만든 노래에 내 목소리·가사 태그·커버를 새로 적용할 때 사용하세요.")
+        self.btn_finalize.setEnabled(False)
+        self.btn_finalize.clicked.connect(self.finalize_selected)
+        lay.addWidget(self.btn_finalize)
+
         row = QHBoxLayout()
         self.btn_reuse = QPushButton("가사·설정 불러오기")
         self.btn_reuse.setProperty("class", "ghost")
@@ -524,27 +648,15 @@ class SongStudio(QWidget):
         self.btn_delete.setToolTip("선택한 노래 삭제")
         self.btn_delete.clicked.connect(self.delete_selected)
         row.addWidget(self.btn_delete)
-        self.btn_cover = QPushButton("🖼 커버")
-        self.btn_cover.setProperty("class", "ghost")
-        self.btn_cover.setToolTip("선택한 노래 MP3에 커버 이미지를 넣습니다")
-        self.btn_cover.clicked.connect(self.set_cover)
-        row.addWidget(self.btn_cover)
         lay.addLayout(row)
 
         player = _card()
         p = QVBoxLayout(player)
         p.setContentsMargins(12, 10, 12, 10)
         p.setSpacing(6)
-        now_row = QHBoxLayout()
-        self.lbl_cover = QLabel()
-        self.lbl_cover.setFixedSize(56, 56)
-        self.lbl_cover.setStyleSheet("background-color: #0f172a; border-radius: 6px;")
-        self.lbl_cover.setScaledContents(True)
-        now_row.addWidget(self.lbl_cover)
         self.lbl_now = _label("노래를 선택하세요", wrap=True)
         self.lbl_now.setStyleSheet("color: #f8fafc; font-weight: bold; font-size: 13px;")
-        now_row.addWidget(self.lbl_now, 1)
-        p.addLayout(now_row)
+        p.addWidget(self.lbl_now)
         self.combo_take = QComboBox()
         self.combo_take.setToolTip("같은 가사로 함께 만들어진 다른 버전")
         self.combo_take.currentIndexChanged.connect(self._on_take_changed)
@@ -579,10 +691,8 @@ class SongStudio(QWidget):
         return b.property("genre") if b else "ballad_piano"
 
     def _gender(self):
-        d = self.combo_voice.currentData()
-        if isinstance(d, dict) and d.get("gender") in ("female", "male"):
-            return d["gender"]
-        return "female"
+        b = self.gender_group.checkedButton()
+        return b.property("value") if b else "female"
 
     def _tempo(self):
         b = self.tempo_group.checkedButton()
@@ -600,90 +710,88 @@ class SongStudio(QWidget):
                 b.setChecked(True)
                 return
 
-    def _load_trained_metas(self):
-        aliases, models, legacy = [], [], []
-        if not self.trained_dir.exists():
-            return aliases, models, legacy
-        for mdir in sorted(self.trained_dir.iterdir()):
-            meta_path = mdir / "meta.json"
-            if not mdir.is_dir() or not meta_path.exists() or mdir.name.startswith("_"):
-                continue
-            try:
-                meta = json.loads(meta_path.read_text(encoding="utf-8"))
-            except Exception:
-                continue
-            adapter = meta.get("adapter_path")
-            if not adapter or not (Path(adapter) / "adapter_config.json").exists():
-                legacy.append(mdir.name)
-                continue
-            meta["name"] = meta.get("name") or mdir.name
-            kind = meta.get("kind") or "song_lora"
-            meta["kind"] = kind
-            (aliases if kind == "speech_clone" else models).append(meta)
-        return aliases, models, legacy
-
-    def _restore_combo(self, combo, prev_name, default=0):
-        idx = default
-        if prev_name:
-            for i in range(combo.count()):
-                d = combo.itemData(i)
-                if isinstance(d, dict) and d.get("name") == prev_name:
-                    idx = i
-                    break
-        combo.setCurrentIndex(idx)
-
-    # ------------------------------------------------------------------ 목소리 / 학습 모델
+    # ------------------------------------------------------------------ 목소리 목록
     def refresh_voices(self):
-        prev_voice = self.combo_voice.currentData()
-        prev_model = self.combo_model.currentData() if hasattr(self, "combo_model") else None
-        prev_voice_name = prev_voice.get("name") if isinstance(prev_voice, dict) else None
-        prev_model_name = prev_model.get("name") if isinstance(prev_model, dict) else None
-        aliases, models, legacy = self._load_trained_metas()
-        self.combo_voice.blockSignals(True)
-        self.combo_model.blockSignals(True)
-        self.combo_voice.clear()
-        self.combo_voice.addItem("여성", {"kind": "builtin", "gender": "female"})
-        self.combo_voice.addItem("남성", {"kind": "builtin", "gender": "male"})
-        for meta in aliases:
-            self.combo_voice.addItem(f"🎤 {meta['name']}", meta)
-        self.combo_model.clear()
-        self.combo_model.addItem("사용 안 함", None)
-        for meta in models:
-            self.combo_model.addItem(meta["name"], meta)
-        self._restore_combo(self.combo_voice, prev_voice_name, 0)
-        self._restore_combo(self.combo_model, prev_model_name, 0)
-        self.combo_voice.blockSignals(False)
-        self.combo_model.blockSignals(False)
-        self._legacy_voices = legacy
-        self._on_voice_changed()
+        """보컬(남성/여성/내 별칭)과 곡 학습 모델(1000곡 코퍼스)을 '분리'해 채운다.
 
-    def _active_adapter(self):
-        """별칭 목소리가 있으면 그 LoRA를, 없으면 학습 모델을 쓴다. 둘은 동시에 겹치지 않는다."""
-        voice = self.combo_voice.currentData()
-        if isinstance(voice, dict) and voice.get("kind") == "speech_clone":
-            return voice
-        model = self.combo_model.currentData()
-        if isinstance(model, dict) and model.get("adapter_path"):
-            return model
-        return None
+        기존에는 폴더를 그대로 나열해 1000곡 모델까지 목소리 목록에 섞였다.
+        voice_catalog 가 메타데이터(role/songs_count/train_minutes)로 역할을 판정해 나눈다.
+        """
+        prev_name = None
+        d = self.combo_voice.currentData()
+        if isinstance(d, dict):
+            prev_name = d.get("name")
+        prev_song = None
+        d2 = self.combo_song_model.currentData()
+        if isinstance(d2, dict):
+            prev_song = d2.get("name")
+
+        self._catalog = voice_catalog.scan_models(self.trained_dir)
+        self.combo_voice.blockSignals(True)
+        self.combo_voice.clear()
+        for e in voice_catalog.voice_combo_entries(self._catalog):
+            self.combo_voice.addItem(e["label"], e["data"])
+        idx = 1 if self.combo_voice.count() > 1 else 0
+        for i in range(self.combo_voice.count()):
+            dd = self.combo_voice.itemData(i)
+            if prev_name and isinstance(dd, dict) and dd.get("name") == prev_name:
+                idx = i
+        self.combo_voice.setCurrentIndex(idx)
+        self.combo_voice.blockSignals(False)
+
+        self.combo_song_model.blockSignals(True)
+        self.combo_song_model.clear()
+        for e in voice_catalog.song_model_entries(self._catalog):
+            self.combo_song_model.addItem(e["label"], e["data"])
+            if e.get("disabled"):
+                try:
+                    self.combo_song_model.model().item(self.combo_song_model.count() - 1).setEnabled(False)
+                except Exception:
+                    pass
+        sidx = 0
+        for i in range(self.combo_song_model.count()):
+            dd = self.combo_song_model.itemData(i)
+            if prev_song and isinstance(dd, dict) and dd.get("name") == prev_song:
+                sidx = i
+        if self.combo_song_model.count() > 1 and sidx == 0:
+            sidx = 1     # 코퍼스 모델이 있으면 기본으로 켜 둔다
+        self.combo_song_model.setCurrentIndex(sidx)
+        self.combo_song_model.blockSignals(False)
+
+        self._legacy_voices = [v["name"] for v in self._catalog.get("legacy", [])
+                               if v.get("role") != "song"]
+        self._on_voice_changed()
+        self._on_song_model_changed()
 
     def _on_voice_changed(self):
-        voice = self.combo_voice.currentData()
-        model = self.combo_model.currentData()
-        g = "여성" if self._gender() == "female" else "남성"
-        parts = []
-        if isinstance(voice, dict) and voice.get("kind") == "speech_clone":
-            n = voice.get("clips_count") or voice.get("songs_count") or "?"
-            parts.append(f"별칭 '{voice.get('name')}' ({n}문장)")
-            if isinstance(model, dict):
-                parts.append("학습 모델은 별칭과 겹쳐 이번 곡에는 별칭만 적용")
+        meta = self.combo_voice.currentData()
+        n_song = len(self._catalog.get("song_models", [])) if hasattr(self, "_catalog") else 0
+        if isinstance(meta, dict) and meta.get("builtin"):
+            self.lbl_voice_info.setText(
+                "기본 보컬 — 학습 모델 없이 엔진 보이스로 부릅니다." + (
+                    f" (곡 학습 모델 {n_song}개 사용 가능)" if n_song else ""))
+        elif isinstance(meta, dict):
+            prof = meta.get("voice_profile") or {}
+            f0 = prof.get("f0_median_hz")
+            self.lbl_voice_info.setText(
+                (f"내 목소리 '{meta.get('name')}' · "
+                 f"{meta.get('songs_count', '?')}문장 학습 · "
+                 f"{meta.get('epochs', '?')} epoch"
+                 + (f" · 음높이 {f0}Hz" if f0 else "")))
+        elif getattr(self, "_legacy_voices", None):
+            self.lbl_voice_info.setText("다시 학습이 필요한 이전 방식 모델: " + ", ".join(self._legacy_voices))
         else:
-            parts.append(f"기본 {g} 보컬")
-            if isinstance(model, dict):
-                parts.append(f"학습 모델 {model.get('name')} · {model.get('songs_count', '?')}곡")
-        if getattr(self, "_legacy_voices", None):
-            parts.append("다시 학습 필요: " + ", ".join(self._legacy_voices))
-        self.lbl_voice_info.setText(" · ".join(parts))
+            self.lbl_voice_info.setText("학습한 목소리가 없으면 기본 목소리로 부릅니다.")
+
+    def _on_song_model_changed(self):
+        meta = self.combo_song_model.currentData()
+        if isinstance(meta, dict):
+            self.lbl_song_model_info.setText(
+                f"🎼 {meta.get('name')} · {meta.get('songs_count', '?')}곡 학습 · "
+                f"가사 포함 {meta.get('songs_with_lyrics', '?')}곡 · 강도 {self.combo_song_strength.currentData()}")
+        else:
+            self.lbl_song_model_info.setText(
+                "곡 학습 모델을 고르면 창법·편곡 스타일이 함께 적용됩니다 (목소리 선택과 별개).")
 
     # ------------------------------------------------------------------ 가사 만들기
     def _ollama_alive(self):
@@ -747,10 +855,19 @@ class SongStudio(QWidget):
             QMessageBox.warning(self, "메모리 부족", msg)
             return
 
-        voice = self._active_adapter()
-        caption = build_caption(self._genre(), self._gender(), self._moods(), self.edit_extra.text())
-        if voice and voice.get("trigger_tag"):
-            caption = f"{voice['trigger_tag']}, {caption}"
+        voice = self.combo_voice.currentData()
+        voice = voice if isinstance(voice, dict) else None
+        voice_lora = voice if (voice and not voice.get("builtin") and voice.get("adapter_path")) else None
+        builtin_gender = voice.get("gender") if (voice and voice.get("builtin")) else None
+        song_model = self.combo_song_model.currentData()
+        song_model = song_model if isinstance(song_model, dict) and song_model.get("adapter_path") else None
+
+        caption = build_caption(self._genre(), builtin_gender or self._gender(),
+                               self._moods(), self.edit_extra.text())
+        if voice_lora and voice_lora.get("trigger_tag"):
+            caption = f"{voice_lora['trigger_tag']}, {caption}"
+        if song_model and song_model.get("caption_hint"):
+            caption = f"{caption}, {song_model['caption_hint']}"
         bpm = self._bpm()
         duration = max(estimate_duration_sec(lyrics, bpm), 30)
         takes = self.combo_takes.currentData() or 2
@@ -764,22 +881,31 @@ class SongStudio(QWidget):
         lyrics_file.write_text(lyrics, encoding="utf-8")
         cmd = [str(self.acestep_py), "-u", str(self.base_dir / "audio_engines" / "acestep_official_runner.py"),
                "--prompt-file", str(prompt_file), "--lyrics-file", str(lyrics_file), "--output", str(out_path),
-               "--duration", str(int(duration)), "--steps", "10", "--shift", "3.0", "--bpm", str(bpm),
-               "--candidates", str(takes), "--vocal-language", "ko",
-               "--title", self.edit_title.text().strip() or suggest_title(lyrics) or "제목 없음"]
-        if voice:
-            cmd += ["--lora-path", voice["adapter_path"], "--lora-scale", f"{self.combo_strength.currentData():.2f}"]
+               "--duration", str(int(duration)), "--steps", "8", "--shift", "3.0", "--bpm", str(bpm),
+               "--candidates", str(takes), "--vocal-language", "ko"]
+        if voice_lora:
+            cmd += ["--lora-path", voice_lora["adapter_path"],
+                    "--lora-scale", f"{self.combo_strength.currentData():.2f}"]
+            prof = voice_lora.get("voice_profile") or {}
+            if prof.get("caption_hint"):
+                caption = f"{voice_lora.get('trigger_tag', '')}, {prof['caption_hint']}, " \
+                          + build_caption(self._genre(), self._gender(), self._moods(), self.edit_extra.text())
+                prompt_file.write_text(caption, encoding="utf-8")
+        if song_model:
+            cmd += ["--style-lora-path", song_model["adapter_path"],
+                    "--style-lora-scale", f"{self.combo_song_strength.currentData():.2f}"]
 
         self._pending_meta = {
             "title": self.edit_title.text().strip() or suggest_title(lyrics) or "제목 없음",
             "idea": self.edit_idea.toPlainText().strip(), "genre": self._genre(),
             "genre_name": get_guide(self._genre())["name"], "moods": self._moods(), "gender": self._gender(),
             "tempo": self._tempo(), "bpm": bpm, "form": self.combo_form.currentIndex(),
-            "voice": (self.combo_voice.currentData() or {}).get("name")
-                     or ("여성" if self._gender() == "female" else "남성"),
-            "voice_kind": (self.combo_voice.currentData() or {}).get("kind") or "builtin",
-            "model": (self.combo_model.currentData() or {}).get("name") if isinstance(self.combo_model.currentData(), dict) else None,
+            "voice": voice_lora.get("name") if voice_lora else (f"기본({builtin_gender})" if builtin_gender else None),
             "voice_strength": self.combo_strength.currentData(),
+            "song_model": song_model.get("name") if song_model else None,
+            "song_model_strength": self.combo_song_strength.currentData() if song_model else None,
+            "singer_style": self.combo_singer_style.currentData(),
+            "singer_intensity": self.combo_coach.currentData(),
             "extra": self.edit_extra.text().strip(), "caption": caption, "lyrics": lyrics,
             "duration": duration, "created_at": time.strftime("%Y-%m-%d %H:%M"),
         }
@@ -834,12 +960,94 @@ class SongStudio(QWidget):
             except Exception:
                 pass
         Path(path).with_suffix(".json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
-        try:
-            embed_mp3_meta(path, title=meta.get("title"), lyrics=meta.get("lyrics"))
-        except Exception:
-            pass
         self.refresh_library(select=path)
         self.toggle_play(force_play=True)
+        self._start_finalize(path, meta)
+
+    # ------------------------------------------------------------------ 마무리(음색·다듬기·가사·커버·영상)
+    def _finalize_cmd(self, path, meta):
+        """현재 설정으로 song_finalize.py 명령행을 만든다."""
+        polish = self.combo_polish.currentData() or "natural"
+        want_cover = self.chk_cover.isChecked()
+        want_video = self.chk_intro_video.isChecked()
+        lyrics_path = Path(path).with_suffix(".lyrics.txt")
+        if not lyrics_path.exists():
+            lyrics_path.write_text(meta.get("lyrics", ""), encoding="utf-8")
+        cmd = [sys.executable, "-u", str(FINALIZE_SCRIPT), "--input", str(path),
+               "--output", str(path), "--lyrics-file", str(lyrics_path),
+               "--title", meta.get("title") or "", "--artist", "YUNSEUL-LMM",
+               "--genre", meta.get("genre") or "ballad_piano",
+               "--genre-name", meta.get("genre_name") or "",
+               "--moods", *(meta.get("moods") or []),
+               "--polish", polish,
+               "--singer-style", meta.get("singer_style") or self.combo_singer_style.currentData(),
+               "--singer-intensity", str(meta.get("singer_intensity",
+                                                  self.combo_coach.currentData())),
+               "--cover", "auto" if want_cover else "none"]
+        if not self.chk_lyrics_tag.isChecked():
+            cmd.append("--no-lyrics-tag")
+        voice = self.combo_voice.currentData()
+        if isinstance(voice, dict) and voice.get("name"):
+            prof = Path(self.trained_dir) / str(voice["name"]) / "voice_profile.json"
+            if prof.exists():
+                cmd += ["--profile", str(prof)]
+        if want_video:
+            cmd.append("--video")
+        if polish == "rich":
+            takes = sorted(Path(path).parent.glob(Path(path).stem + "_take*.mp3"))
+            if takes:
+                cmd += ["--double-track", str(takes[0])]
+        return cmd
+
+    def _start_finalize(self, path, meta=None) -> bool:
+        meta = meta or self._load_meta(Path(path))
+        if not FINALIZE_SCRIPT.exists():
+            self.lbl_progress.setText("✅ 완성! (마무리 도구가 없어 원본 그대로 저장)")
+            return False
+        if self.finalize_worker is not None:
+            return False
+        cmd = self._finalize_cmd(path, meta)
+        self.progress_timer.stop()
+        self._song_busy = True
+        self.lbl_progress.setText("✨ 내 목소리 반영 · 부드럽게 다듬는 중...")
+        self.progress.setValue(930)
+        self.finalize_worker = FinalizeWorker(cmd, str(self.base_dir))
+        self.finalize_worker.log_line.connect(lambda m: self.lbl_progress.setText(f"✨ {m}"))
+        self.finalize_worker.finished.connect(self._on_finalize_done)
+        self.finalize_worker.start()
+        self._update_buttons()
+        return True
+
+    def _on_finalize_done(self, ok, path, err):
+        self._song_busy = False
+        self.finalize_worker = None
+        self._update_buttons()
+        target = Path(path) if path else self.current_song
+        if ok:
+            self.progress.setValue(1000)
+            extra = []
+            jp = Path(str(target) + ".finalize.json") if target else None
+            if jp and jp.exists():
+                try:
+                    rep = json.loads(jp.read_text(encoding="utf-8"))
+                    if rep.get("steps", {}).get("embed", {}).get("written", {}).get("SYLT"):
+                        extra.append("가사 동기화")
+                    if rep.get("steps", {}).get("cover", {}).get("path"):
+                        extra.append("커버")
+                    if rep.get("steps", {}).get("video", {}).get("path"):
+                        extra.append("인트로 영상")
+                    if rep.get("warnings"):
+                        self.lbl_progress.setToolTip("\n".join(rep["warnings"][:6]))
+                except Exception:
+                    pass
+            self.lbl_progress.setText("✅ 완성!" + (" (" + " · ".join(extra) + ")" if extra else ""))
+            if target:
+                self.player.setSource(QUrl.fromLocalFile(str(target)))
+        else:
+            self.progress.setValue(1000)
+            self.lbl_progress.setText(f"✅ 노래는 완성됐고, 마무리 단계만 실패했습니다 — {err[:70]}")
+        if target:
+            self.refresh_library(select=target)
 
     def _update_buttons(self):
         busy_l, busy_s = self._lyrics_busy, self._song_busy
@@ -847,6 +1055,8 @@ class SongStudio(QWidget):
         self.btn_lyrics.setText("⏳ 가사 쓰는 중..." if busy_l else "✨ 가사 만들기")
         self.btn_song.setEnabled(not busy_l and not busy_s and bool(self.edit_lyrics.toPlainText().strip()))
         self.btn_song.setText("⏳ 노래 만드는 중..." if busy_s else "🎵 이 가사로 노래 만들기")
+        has_song = self.current_song is not None
+        self.btn_finalize.setEnabled(not busy_l and not busy_s and has_song)
         if not busy_s and not self.edit_lyrics.toPlainText().strip():
             self.lbl_progress.setText("가사가 준비되면 노래를 만들 수 있습니다.")
         elif not busy_s and self.lbl_progress.text().startswith("가사가 준비되면"):
@@ -895,7 +1105,6 @@ class SongStudio(QWidget):
         has = self.current_song is not None
         self.btn_reuse.setEnabled(has)
         self.btn_delete.setEnabled(has)
-        self.btn_cover.setEnabled(has)
 
     def _selected_path(self):
         item = self.list_songs.currentItem()
@@ -921,8 +1130,6 @@ class SongStudio(QWidget):
         self.player.setSource(QUrl.fromLocalFile(str(mp3)))
         self.btn_reuse.setEnabled(True)
         self.btn_delete.setEnabled(True)
-        self.btn_cover.setEnabled(True)
-        self._show_cover(mp3)
 
     def _on_take_changed(self, _idx):
         path = self.combo_take.currentData()
@@ -968,6 +1175,8 @@ class SongStudio(QWidget):
         self.edit_extra.setText(meta.get("extra", ""))
         if meta.get("genre"):
             self._set_checked(self.genre_group, "genre", meta["genre"])
+        if meta.get("gender"):
+            self._set_checked(self.gender_group, "value", meta["gender"])
         if meta.get("tempo"):
             self._set_checked(self.tempo_group, "value", meta["tempo"])
         if isinstance(meta.get("form"), int):
@@ -978,53 +1187,12 @@ class SongStudio(QWidget):
             for b in self.mood_buttons:
                 if b.text() == m:
                     b.setChecked(True)
-        voice_name = meta.get("voice")
-        if meta.get("gender") in ("female", "male") and meta.get("voice_kind") != "speech_clone":
-            self.combo_voice.setCurrentIndex(0 if meta["gender"] == "female" else 1)
-        if voice_name and meta.get("voice_kind") == "speech_clone":
-            self._restore_combo(self.combo_voice, voice_name, self.combo_voice.currentIndex())
-        model_name = meta.get("model")
-        if not model_name and meta.get("voice_kind") == "song_lora":
-            model_name = voice_name
-        self._restore_combo(self.combo_model, model_name, 0)
+        if meta.get("voice"):
+            for i in range(self.combo_voice.count()):
+                d = self.combo_voice.itemData(i)
+                if isinstance(d, dict) and d.get("name") == meta["voice"]:
+                    self.combo_voice.setCurrentIndex(i)
         self.lbl_lyrics_status.setText("이전 노래의 가사와 설정을 불러왔습니다. 고친 뒤 다시 만들어 보세요.")
-
-    def _show_cover(self, mp3: Path):
-        data = read_cover_bytes(mp3)
-        if data:
-            pix = QPixmap()
-            pix.loadFromData(data)
-            self.lbl_cover.setPixmap(pix)
-        else:
-            self.lbl_cover.setPixmap(QPixmap())
-            self.lbl_cover.setText("")
-
-    def set_cover(self):
-        p = self._selected_path()
-        if not p:
-            return
-        img, _ = QFileDialog.getOpenFileName(
-            self, "커버 이미지 선택", "", "이미지 (*.jpg *.jpeg *.png *.webp);;All Files (*)")
-        if not img:
-            return
-        self.player.stop()
-        ok = False
-        targets = [p, *p.parent.glob(p.stem + "_take*.mp3")]
-        for f in targets:
-            try:
-                ok = embed_mp3_meta(f, cover_path=img) or ok
-            except Exception as e:
-                QMessageBox.warning(self, "커버 넣기 실패", str(e))
-                return
-        if not ok:
-            QMessageBox.warning(self, "커버 넣기 실패", "이미지를 MP3에 넣지 못했습니다.")
-            return
-        meta = self._load_meta(p)
-        meta["cover"] = img
-        p.with_suffix(".json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
-        self._show_cover(p)
-        self.player.setSource(QUrl.fromLocalFile(str(p)))
-        QMessageBox.information(self, "커버 넣기", "선택한 노래 MP3에 커버 이미지를 넣었습니다.\n파일 정보나 음악 앱에서 앨범 표지로 보입니다.")
 
     def delete_selected(self):
         p = self._selected_path()
