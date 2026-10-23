@@ -2145,7 +2145,7 @@ class YunseulLMMStudio(QWidget):
             )
             if reply == QMessageBox.StandardButton.Yes:
                 self.tabs.setCurrentWidget(self.tab_music)
-                combo = self.tab_music.combo_voice
+                combo = self.tab_music.combo_voice if kind == "speech_clone" else self.tab_music.combo_model
                 for i in range(combo.count()):
                     if model_name in combo.itemText(i):
                         combo.setCurrentIndex(i)

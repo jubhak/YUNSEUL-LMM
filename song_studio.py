@@ -319,23 +319,31 @@ class SongStudio(QWidget):
         lay.addWidget(_label("목소리 (여성 · 남성 · 별칭)", "h2"))
         self.combo_voice = QComboBox()
         self.combo_voice.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
-        self.combo_voice.setToolTip("기본 여성/남성, 또는 학습해 둔 별칭 목소리를 고릅니다.")
+        self.combo_voice.setToolTip("여성, 남성, 또는 따라 읽어 저장한 별칭 목소리입니다.")
         lay.addWidget(self.combo_voice)
+
+        lay.addWidget(_label("학습 모델", "h2"))
+        self.combo_model = QComboBox()
+        self.combo_model.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.combo_model.setToolTip("가수 노래로 학습한 모델입니다. 목소리 별칭과는 따로 고릅니다.")
+        lay.addWidget(self.combo_model)
+
         vrow = QHBoxLayout()
         self.combo_strength = QComboBox()
-        for label, val in [("목소리 반영 100%", 1.0), ("반영 80%", 0.8), ("반영 60%", 0.6), ("반영 120%", 1.2)]:
+        for label, val in [("반영 100%", 1.0), ("반영 80%", 0.8), ("반영 60%", 0.6), ("반영 120%", 1.2)]:
             self.combo_strength.addItem(label, val)
         self.combo_strength.setToolTip("발음이 뭉개지면 낮추고, 학습한 느낌이 약하면 높이세요.")
         vrow.addWidget(self.combo_strength, 1)
         btn_refresh = QPushButton("🔄")
         btn_refresh.setProperty("class", "ghost")
-        btn_refresh.setToolTip("학습한 목소리 목록 새로고침")
+        btn_refresh.setToolTip("목소리와 학습 모델 목록 새로고침")
         btn_refresh.clicked.connect(self.refresh_voices)
         vrow.addWidget(btn_refresh)
         lay.addLayout(vrow)
         self.lbl_voice_info = _label("", "hint", wrap=True)
         lay.addWidget(self.lbl_voice_info)
         self.combo_voice.currentIndexChanged.connect(self._on_voice_changed)
+        self.combo_model.currentIndexChanged.connect(self._on_voice_changed)
 
         lay.addWidget(_label("한 번에 만들 버전 수", "h2"))
         self.combo_takes = QComboBox()
@@ -592,67 +600,90 @@ class SongStudio(QWidget):
                 b.setChecked(True)
                 return
 
-    # ------------------------------------------------------------------ 목소리 목록
+    def _load_trained_metas(self):
+        aliases, models, legacy = [], [], []
+        if not self.trained_dir.exists():
+            return aliases, models, legacy
+        for mdir in sorted(self.trained_dir.iterdir()):
+            meta_path = mdir / "meta.json"
+            if not mdir.is_dir() or not meta_path.exists() or mdir.name.startswith("_"):
+                continue
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            adapter = meta.get("adapter_path")
+            if not adapter or not (Path(adapter) / "adapter_config.json").exists():
+                legacy.append(mdir.name)
+                continue
+            meta["name"] = meta.get("name") or mdir.name
+            kind = meta.get("kind") or "song_lora"
+            meta["kind"] = kind
+            (aliases if kind == "speech_clone" else models).append(meta)
+        return aliases, models, legacy
+
+    def _restore_combo(self, combo, prev_name, default=0):
+        idx = default
+        if prev_name:
+            for i in range(combo.count()):
+                d = combo.itemData(i)
+                if isinstance(d, dict) and d.get("name") == prev_name:
+                    idx = i
+                    break
+        combo.setCurrentIndex(idx)
+
+    # ------------------------------------------------------------------ 목소리 / 학습 모델
     def refresh_voices(self):
-        prev = self.combo_voice.currentData()
-        prev_name = prev.get("name") if isinstance(prev, dict) else None
+        prev_voice = self.combo_voice.currentData()
+        prev_model = self.combo_model.currentData() if hasattr(self, "combo_model") else None
+        prev_voice_name = prev_voice.get("name") if isinstance(prev_voice, dict) else None
+        prev_model_name = prev_model.get("name") if isinstance(prev_model, dict) else None
+        aliases, models, legacy = self._load_trained_metas()
         self.combo_voice.blockSignals(True)
+        self.combo_model.blockSignals(True)
         self.combo_voice.clear()
         self.combo_voice.addItem("여성", {"kind": "builtin", "gender": "female"})
         self.combo_voice.addItem("남성", {"kind": "builtin", "gender": "male"})
-        legacy = []
-        first_alias = None
-        if self.trained_dir.exists():
-            for mdir in sorted(self.trained_dir.iterdir()):
-                meta_path = mdir / "meta.json"
-                if not mdir.is_dir() or not meta_path.exists() or mdir.name.startswith("_"):
-                    continue
-                try:
-                    meta = json.loads(meta_path.read_text(encoding="utf-8"))
-                except Exception:
-                    continue
-                adapter = meta.get("adapter_path")
-                if not adapter or not (Path(adapter) / "adapter_config.json").exists():
-                    legacy.append(mdir.name)
-                    continue
-                meta["name"] = meta.get("name") or mdir.name
-                kind = meta.get("kind") or "song_lora"
-                meta["kind"] = kind
-                if kind == "speech_clone":
-                    label = f"🎤 {meta['name']}"
-                else:
-                    label = f"🌟 {meta['name']}"
-                self.combo_voice.addItem(label, meta)
-                if first_alias is None:
-                    first_alias = self.combo_voice.count() - 1
-        idx = first_alias if first_alias is not None else 0
-        for i in range(self.combo_voice.count()):
-            d = self.combo_voice.itemData(i)
-            if prev_name and isinstance(d, dict) and d.get("name") == prev_name:
-                idx = i
-        self.combo_voice.setCurrentIndex(idx)
+        for meta in aliases:
+            self.combo_voice.addItem(f"🎤 {meta['name']}", meta)
+        self.combo_model.clear()
+        self.combo_model.addItem("사용 안 함", None)
+        for meta in models:
+            self.combo_model.addItem(meta["name"], meta)
+        self._restore_combo(self.combo_voice, prev_voice_name, 0)
+        self._restore_combo(self.combo_model, prev_model_name, 0)
         self.combo_voice.blockSignals(False)
+        self.combo_model.blockSignals(False)
         self._legacy_voices = legacy
         self._on_voice_changed()
 
+    def _active_adapter(self):
+        """별칭 목소리가 있으면 그 LoRA를, 없으면 학습 모델을 쓴다. 둘은 동시에 겹치지 않는다."""
+        voice = self.combo_voice.currentData()
+        if isinstance(voice, dict) and voice.get("kind") == "speech_clone":
+            return voice
+        model = self.combo_model.currentData()
+        if isinstance(model, dict) and model.get("adapter_path"):
+            return model
+        return None
+
     def _on_voice_changed(self):
-        meta = self.combo_voice.currentData()
-        if not isinstance(meta, dict) or meta.get("kind") == "builtin":
-            g = "여성" if self._gender() == "female" else "남성"
-            extra = ""
-            if getattr(self, "_legacy_voices", None):
-                extra = " · 다시 학습이 필요한 이전 모델: " + ", ".join(self._legacy_voices)
-            self.lbl_voice_info.setText(f"기본 {g} 보컬로 부릅니다.{extra}")
-            return
-        if meta.get("kind") == "speech_clone":
-            n = meta.get("clips_count") or meta.get("songs_count") or "?"
-            self.lbl_voice_info.setText(
-                f"내 목소리 '{meta.get('name')}' · {n}문장 학습 · {meta.get('created_at', '')[:10]}")
-            if self.combo_strength.currentIndex() == 0:
-                self.combo_strength.setCurrentIndex(1)
-            return
-        self.lbl_voice_info.setText(
-            f"{meta.get('songs_count', '?')}곡으로 학습 · {meta.get('epochs', '?')} epoch · {meta.get('created_at', '')[:10]}")
+        voice = self.combo_voice.currentData()
+        model = self.combo_model.currentData()
+        g = "여성" if self._gender() == "female" else "남성"
+        parts = []
+        if isinstance(voice, dict) and voice.get("kind") == "speech_clone":
+            n = voice.get("clips_count") or voice.get("songs_count") or "?"
+            parts.append(f"별칭 '{voice.get('name')}' ({n}문장)")
+            if isinstance(model, dict):
+                parts.append("학습 모델은 별칭과 겹쳐 이번 곡에는 별칭만 적용")
+        else:
+            parts.append(f"기본 {g} 보컬")
+            if isinstance(model, dict):
+                parts.append(f"학습 모델 {model.get('name')} · {model.get('songs_count', '?')}곡")
+        if getattr(self, "_legacy_voices", None):
+            parts.append("다시 학습 필요: " + ", ".join(self._legacy_voices))
+        self.lbl_voice_info.setText(" · ".join(parts))
 
     # ------------------------------------------------------------------ 가사 만들기
     def _ollama_alive(self):
@@ -716,8 +747,7 @@ class SongStudio(QWidget):
             QMessageBox.warning(self, "메모리 부족", msg)
             return
 
-        voice = self.combo_voice.currentData()
-        voice = voice if isinstance(voice, dict) and voice.get("kind") != "builtin" else None
+        voice = self._active_adapter()
         caption = build_caption(self._genre(), self._gender(), self._moods(), self.edit_extra.text())
         if voice and voice.get("trigger_tag"):
             caption = f"{voice['trigger_tag']}, {caption}"
@@ -745,8 +775,10 @@ class SongStudio(QWidget):
             "idea": self.edit_idea.toPlainText().strip(), "genre": self._genre(),
             "genre_name": get_guide(self._genre())["name"], "moods": self._moods(), "gender": self._gender(),
             "tempo": self._tempo(), "bpm": bpm, "form": self.combo_form.currentIndex(),
-            "voice": voice.get("name") if voice else ("여성" if self._gender() == "female" else "남성"),
-            "voice_kind": (voice or {}).get("kind") or "builtin",
+            "voice": (self.combo_voice.currentData() or {}).get("name")
+                     or ("여성" if self._gender() == "female" else "남성"),
+            "voice_kind": (self.combo_voice.currentData() or {}).get("kind") or "builtin",
+            "model": (self.combo_model.currentData() or {}).get("name") if isinstance(self.combo_model.currentData(), dict) else None,
             "voice_strength": self.combo_strength.currentData(),
             "extra": self.edit_extra.text().strip(), "caption": caption, "lyrics": lyrics,
             "duration": duration, "created_at": time.strftime("%Y-%m-%d %H:%M"),
@@ -947,15 +979,14 @@ class SongStudio(QWidget):
                 if b.text() == m:
                     b.setChecked(True)
         voice_name = meta.get("voice")
-        if voice_name:
-            for i in range(self.combo_voice.count()):
-                d = self.combo_voice.itemData(i)
-                if self.combo_voice.itemText(i) == voice_name or (
-                        isinstance(d, dict) and d.get("name") == voice_name):
-                    self.combo_voice.setCurrentIndex(i)
-                    break
-        elif meta.get("gender") in ("female", "male"):
+        if meta.get("gender") in ("female", "male") and meta.get("voice_kind") != "speech_clone":
             self.combo_voice.setCurrentIndex(0 if meta["gender"] == "female" else 1)
+        if voice_name and meta.get("voice_kind") == "speech_clone":
+            self._restore_combo(self.combo_voice, voice_name, self.combo_voice.currentIndex())
+        model_name = meta.get("model")
+        if not model_name and meta.get("voice_kind") == "song_lora":
+            model_name = voice_name
+        self._restore_combo(self.combo_model, model_name, 0)
         self.lbl_lyrics_status.setText("이전 노래의 가사와 설정을 불러왔습니다. 고친 뒤 다시 만들어 보세요.")
 
     def _show_cover(self, mp3: Path):
