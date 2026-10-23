@@ -240,8 +240,12 @@ def build_profile(name: str, clips, out_dir: Path):
     bright = "bright" if centroid > 2100 else "warm" if centroid > 1500 else "dark"
     breath = "breathy" if hnr < 8 else "clear" if hnr > 16 else "natural"
     hint = (f"{gender} {bright} {breath} mid-range lead vocal, natural Korean diction, "
-            f"close-mic intimate tone")
+            f"close-mic tone, melodic sustained singing, connected vowels, stable singer identity, "
+            f"smooth register transitions, controlled breath support, preserve melody pitch")
     profile = {
+        "source_type": "speech",
+        "allow_singing_transpose": False,
+        "singing_capability": "identity_reference_not_singing_range_measurement",
         "name": name,
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "n_clips": len([p for p in per if not p.get("skipped")]),
@@ -258,7 +262,8 @@ def build_profile(name: str, clips, out_dir: Path):
         "breathiness": breath,
         "caption_hint": hint,
         "lora_scale_hint": 1.0 if total > 60 else 0.85,
-        "sing_range_suggest_hz": [round(p10 * 0.9, 1), round(p90 * 1.35, 1)],
+        "sing_range_suggest_hz": None,  # 낭독 녹음만으로 실제 가창 음역을 측정할 수 없음
+        "speech_range_hz": [round(p10, 1), round(p90, 1)],
         "clips": per,
         "quality_notes": _quality_notes(len(ok), total, cents, formant, hnr),
     }
@@ -275,7 +280,7 @@ def _quality_notes(n, total, cents, formant, hnr):
     elif n < 20:
         notes.append(f"{n}문장으로 학습합니다. 30문장이면 억양이 더 자연스러워집니다.")
     if total < 45:
-        notes.append(f"총 발화 {total:.0f}초 — 60초 이상이면 노래 표현력이 좋아집니다.")
+        notes.append(f"총 발화 {total:.0f}초 — 충분한 녹음은 음색 학습에 유리하지만 가창 능력은 별도 노래 샘플로 확인하세요.")
     if cents > 70:
         notes.append(f"음높이 흔들림이 큽니다({cents:.0f} cent). 같은 문장을 2번 녹음해 보세요.")
     if not formant:

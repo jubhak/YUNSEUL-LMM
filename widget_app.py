@@ -483,7 +483,7 @@ class VocalTrainingWorker(QThread):
     sig_log = pyqtSignal(str)
     sig_finished = pyqtSignal(bool, str, str)
 
-    def __init__(self, model_name, audio_files, preset="standard", genre_filter="kpop_ballad"):
+    def __init__(self, model_name, audio_files, preset="standard", genre_filter="all"):
         super().__init__()
         self.model_name = re.sub(r'[^\w\s-]', '', model_name).strip() or "CustomSinger"
         self.audio_files = [str(Path(p).resolve()) for p in audio_files if Path(p).exists()]
@@ -916,7 +916,8 @@ class YunseulLMMStudio(QWidget):
         # 설정 바
         top_bar = QHBoxLayout()
         top_bar.addWidget(QLabel("주제:"))
-        self.edit_topic = QLineEdit("인공지능의 현대 사회에 미치는 영향과 인간-AI 공존의 미래")
+        self.edit_topic = QLineEdit()
+        self.edit_topic.setPlaceholderText("새 전자책의 주제")
         self.edit_topic.setStyleSheet("background-color: #1e293b; color: white; border: 1px solid #334155; border-radius: 6px; padding: 6px 10px;")
         top_bar.addWidget(self.edit_topic)
 
@@ -1039,10 +1040,6 @@ class YunseulLMMStudio(QWidget):
                 border-radius: 8px; padding: 12px; font-size: 13px; font-family: 'Consolas', 'Segoe UI', monospace; line-height: 1.6;
             }
         """)
-        # 기존 생성된 전자책 원고 불러오기
-        existing_ebook = BATCH_OUT / "ebook-01.md"
-        if existing_ebook.exists():
-            self.txt_ebook.setPlainText(existing_ebook.read_text(encoding="utf-8"))
         layout.addWidget(self.txt_ebook)
 
         # 하단 액션 바
@@ -1052,6 +1049,9 @@ class YunseulLMMStudio(QWidget):
         self.txt_ebook.textChanged.connect(lambda: self.lbl_word_count.setText(f"글자 수: {len(self.txt_ebook.toPlainText()):,}자"))
         bot_bar.addWidget(self.lbl_word_count)
         bot_bar.addStretch()
+        btn_new = QPushButton("📝 새로 작성")
+        btn_new.clicked.connect(self.new_ebook_workspace)
+        bot_bar.addWidget(btn_new)
 
         btn_save = QPushButton("💾 원고 임시저장")
         btn_save.setStyleSheet("background-color: #1e293b; color: white; border: 1px solid #475569; border-radius: 6px; padding: 6px 14px;")
@@ -1079,7 +1079,19 @@ class YunseulLMMStudio(QWidget):
         btn_open_books.clicked.connect(lambda: os.startfile(str(BOOKS_DIR)))
         bot_bar.addWidget(btn_open_books)
         layout.addLayout(bot_bar)
-
+        self._ebook_restoring = True
+        self._ebook_draft_path = BATCH_OUT / "ebook-session.json"
+        self._ebook_autosave = QTimer(self)
+        self._ebook_autosave.setSingleShot(True)
+        self._ebook_autosave.timeout.connect(self._save_ebook_workspace)
+        self._restore_ebook_workspace()
+        for field in (self.edit_topic, self.edit_ebook_persona):
+            field.textChanged.connect(self._queue_ebook_autosave)
+        self.txt_ebook.textChanged.connect(self._queue_ebook_autosave)
+        self.combo_length.currentIndexChanged.connect(self._queue_ebook_autosave)
+        self.combo_ebook_genre.currentIndexChanged.connect(self._queue_ebook_autosave)
+        self.spin_ebook_pages.valueChanged.connect(self._queue_ebook_autosave)
+        self._ebook_restoring = False
         return w
 
     # -------------------------------------------------------------------------
@@ -1101,16 +1113,15 @@ class YunseulLMMStudio(QWidget):
 
         self.list_sources = QListWidget()
         self.list_sources.setStyleSheet("background-color: #0f172a; color: white; border: 1px solid #1e293b; border-radius: 8px;")
-        src_dir = BASE_DIR / "blog_sources"
-        if src_dir.exists():
-            for f in src_dir.glob("*.md"):
-                self.list_sources.addItem(f.name)
         left_layout.addWidget(self.list_sources)
 
         btn_add_doc = QPushButton("➕ 파일 추가")
         btn_add_doc.setStyleSheet("background-color: #1e293b; color: white; border: 1px solid #475569; border-radius: 6px; padding: 5px;")
         btn_add_doc.clicked.connect(self.add_source_file)
         left_layout.addWidget(btn_add_doc)
+        btn_clear_merge = QPushButton("새 병합 작업 (입력/결과 비우기)")
+        btn_clear_merge.clicked.connect(self.clear_merge_workspace)
+        left_layout.addWidget(btn_clear_merge)
         splitter.addWidget(left_pane)
 
         # 우측: 재구성 프롬프트 & 결과 에디터
@@ -1120,7 +1131,8 @@ class YunseulLMMStudio(QWidget):
 
         prompt_box = QHBoxLayout()
         prompt_box.addWidget(QLabel("통합 지침:"))
-        self.edit_merge_prompt = QLineEdit("원문들의 핵심 통찰을 종합하여 '2026 자율 AI 에이전트와 순차 배치가 여는 미래'로 재구성하라")
+        self.edit_merge_prompt = QLineEdit()
+        self.edit_merge_prompt.setPlaceholderText("이번 작업의 통합 지침을 입력하세요")
         self.edit_merge_prompt.setStyleSheet("background-color: #1e293b; color: white; border: 1px solid #334155; border-radius: 6px; padding: 6px 10px;")
         prompt_box.addWidget(self.edit_merge_prompt)
 
@@ -1132,9 +1144,6 @@ class YunseulLMMStudio(QWidget):
 
         self.txt_merge_res = QTextEdit()
         self.txt_merge_res.setStyleSheet("background-color: #0f172a; color: #f1f5f9; border: 1px solid #1e293b; border-radius: 8px; padding: 10px; font-size: 13px;")
-        existing_rewrite = BATCH_OUT / "rewrite-01.md"
-        if existing_rewrite.exists():
-            self.txt_merge_res.setPlainText(existing_rewrite.read_text(encoding="utf-8"))
         right_layout.addWidget(self.txt_merge_res)
 
         m_bot_bar = QHBoxLayout()
@@ -1267,8 +1276,11 @@ class YunseulLMMStudio(QWidget):
         form_filter = QHBoxLayout()
         form_filter.addWidget(QLabel("장르 필터:"))
         self.combo_genre_filter = QComboBox()
-        self.combo_genre_filter.addItem("🎯 K-pop 및 감성 발라드만 선별 학습 (타 장르 자동 PASS - 권장)", "kpop_ballad")
-        self.combo_genre_filter.addItem("🌐 모든 장르 제한 없이 학습 (전체 포함)", "all")
+        from training_genres import GENRES
+        for key, (label, _) in GENRES.items():
+            self.combo_genre_filter.addItem(label, key)
+        self.combo_genre_filter.addItem("기존 K-pop/발라드 자동 선별 (타 장르 제외)", "kpop_ballad")
+        self.combo_genre_filter.setToolTip("장르 지정은 선택 파일의 학습 라벨입니다. 전체 장르는 태그/파일명에서 확인하며 불명확하면 일반 음악으로 표기합니다.")
         self.combo_genre_filter.setStyleSheet("""
             QComboBox {
                 background-color: #1e293b; color: white; border: 1px solid #334155;
@@ -1654,6 +1666,70 @@ class YunseulLMMStudio(QWidget):
     # -------------------------------------------------------------------------
     # Actions: eBook Generation
     # -------------------------------------------------------------------------
+    def _queue_ebook_autosave(self, *_):
+        if not self._ebook_restoring:
+            self._ebook_autosave.start(400)
+
+    def _save_ebook_workspace(self):
+        from workspace_state import save_draft
+        state = {"topic": self.edit_topic.text(), "body": self.txt_ebook.toPlainText(),
+                 "persona": self.edit_ebook_persona.text(), "pages": self.spin_ebook_pages.value(),
+                 "genre": self.combo_ebook_genre.currentData(), "length": self.combo_length.currentIndex()}
+        try:
+            save_draft(self._ebook_draft_path, state)
+        except OSError as exc:
+            self.lbl_word_count.setText(f"자동 저장 실패: {exc}")
+            return False
+        return True
+
+    def _restore_ebook_workspace(self):
+        from workspace_state import load_draft
+        state = load_draft(self._ebook_draft_path)
+        self.edit_topic.setText(str(state.get("topic", "")))
+        self.txt_ebook.setPlainText(str(state.get("body", "")))
+        self.edit_ebook_persona.setText(str(state.get("persona", "")))
+        try:
+            self.spin_ebook_pages.setValue(int(state.get("pages", 0)))
+            self.combo_length.setCurrentIndex(max(0, min(self.combo_length.count()-1, int(state.get("length", 0)))))
+        except (ValueError, TypeError):
+            pass
+        idx = self.combo_ebook_genre.findData(state.get("genre"))
+        if idx >= 0:
+            self.combo_ebook_genre.setCurrentIndex(idx)
+
+    def new_ebook_workspace(self):
+        if getattr(self, "ebook_worker", None) and self.ebook_worker.isRunning():
+            QMessageBox.information(self, "집필 중", "집필 중단이 완료된 후 새로 작성하세요.")
+            return
+        if self.txt_ebook.toPlainText().strip() or self.edit_topic.text().strip():
+            if QMessageBox.question(self, "새로 작성", "현재 원고를 백업하고 새 원고로 시작할까요?") != QMessageBox.StandardButton.Yes:
+                return
+        self._ebook_autosave.stop()
+        if not self._save_ebook_workspace():
+            QMessageBox.warning(self, "저장 실패", "현재 원고를 저장하지 못해 초기화를 중단했습니다.")
+            return
+        if self.txt_ebook.toPlainText().strip() or self.edit_topic.text().strip():
+            import uuid
+            backup = self._ebook_draft_path.with_name("ebook-backup-" + uuid.uuid4().hex + ".json")
+            try:
+                shutil.copy2(self._ebook_draft_path, backup)
+            except OSError as exc:
+                QMessageBox.warning(self, "백업 실패", str(exc))
+                return
+        self._ebook_restoring = True
+        self.edit_topic.clear()
+        self.txt_ebook.clear()
+        self.edit_ebook_persona.clear()
+        self.combo_length.setCurrentIndex(0)
+        self.combo_ebook_genre.setCurrentIndex(0)
+        self.spin_ebook_pages.setValue(0)
+        self.lbl_ebook_persona.clear()
+        self.frame_ebook_progress.hide()
+        self.pbar_ebook.setValue(0)
+        self._ebook_restoring = False
+        self._save_ebook_workspace()  # empty tombstone prevents old draft resurrection
+        self.edit_topic.setFocus()
+
     def _on_ebook_genre_changed(self):
         key = self.combo_ebook_genre.currentData()
         d = ebook_persona.persona_dict(key)
@@ -1757,6 +1833,7 @@ class YunseulLMMStudio(QWidget):
 
     def on_ebook_chapter_done(self, ch_title, ch_content, full_accumulated_text):
         self.txt_ebook.setPlainText(full_accumulated_text)
+        self._save_ebook_workspace()
         sb = self.txt_ebook.verticalScrollBar()
         sb.setValue(sb.maximum())
 
@@ -1886,9 +1963,25 @@ class YunseulLMMStudio(QWidget):
     def add_source_file(self):
         path, _ = QFileDialog.getOpenFileName(self, "참고 원문 파일 선택", "", "Markdown/Text (*.md *.txt);;All Files (*)")
         if path:
-            self.list_sources.addItem(Path(path).name)
+            item = QListWidgetItem(Path(path).name)
+            item.setData(Qt.ItemDataRole.UserRole, str(Path(path).resolve()))
+            item.setToolTip(str(Path(path).resolve()))
+            self.list_sources.addItem(item)
+
+    def clear_merge_workspace(self):
+        if getattr(self, "merge_worker", None) and self.merge_worker.isRunning():
+            QMessageBox.information(self, "작업 중", "병합 완료 후 새 작업을 시작하세요.")
+            return
+        self.list_sources.clear()
+        self.edit_merge_prompt.clear()
+        self.txt_merge_res.clear()
 
     def start_merge_generation(self):
+        if getattr(self, "merge_worker", None) and self.merge_worker.isRunning():
+            return
+        if not self.list_sources.count() or not self.edit_merge_prompt.text().strip():
+            QMessageBox.warning(self, "입력 필요", "이번 작업의 원문 파일과 통합 지침을 입력하세요.")
+            return
         if not self.is_server_alive():
             QMessageBox.warning(self, "서버 미실행", "Ollama 서버를 먼저 켜주세요.")
             return
@@ -1901,12 +1994,15 @@ class YunseulLMMStudio(QWidget):
         instruction = self.edit_merge_prompt.text().strip()
         # 원문 내용 모으기
         sources_text = ""
-        src_dir = BASE_DIR / "blog_sources"
         for i in range(self.list_sources.count()):
-            fname = self.list_sources.item(i).text()
-            fpath = src_dir / fname
-            if fpath.exists():
-                sources_text += f"\n\n[참고 자료: {fname}]\n" + fpath.read_text(encoding="utf-8")
+            item = self.list_sources.item(i)
+            fpath = Path(item.data(Qt.ItemDataRole.UserRole) or "")
+            try:
+                content = fpath.read_text(encoding="utf-8-sig")
+            except (OSError, UnicodeError) as exc:
+                QMessageBox.warning(self, "원문 읽기 실패", f"{item.text()}: {exc}")
+                return
+            sources_text += f"\n\n[참고 자료: {fpath.name}]\n" + content
 
         prompt = f"다음 자료들을 바탕으로 지침에 따라 하나의 분석글로 재구성하라:\n\n{sources_text}\n\n[지침]\n{instruction}\n- 1,500자 이상 서술\n- 말미 출처 명시"
 
@@ -2053,7 +2149,7 @@ class YunseulLMMStudio(QWidget):
             return
 
         preset = self.combo_train_preset.currentData() or "standard"
-        genre_filter = self.combo_genre_filter.currentData() or "kpop_ballad"
+        genre_filter = self.combo_genre_filter.currentData() or "all"
         audio_files = [self.list_train_files.item(i).text() for i in range(self.list_train_files.count())]
 
         self.btn_start_train.setEnabled(False)
@@ -2180,6 +2276,8 @@ class YunseulLMMStudio(QWidget):
             self.clean_exit()
 
     def clean_exit(self):
+        self._ebook_autosave.stop()
+        self._save_ebook_workspace()
         # 0. 백그라운드 스레드 및 타이머 안전 정지
         if hasattr(self, "ebook_timer") and self.ebook_timer.isActive():
             self.ebook_timer.stop()

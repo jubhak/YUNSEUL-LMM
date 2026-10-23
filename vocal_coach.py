@@ -253,7 +253,8 @@ def phrase_dynamics(y, sr=SR, amount=0.85) -> tuple:
                 gains[i:i + atk] *= np.linspace(0.90, 1.0, atk) ** amount
         i = j + 1
     gi = np.interp(np.arange(len(mono)), np.arange(n) * hop + hop / 2, gains)
-    gi = np.convolve(gi, np.ones(48, dtype=np.float32) / 48, mode="same")
+    from audio_dsp_safe import smooth_edge
+    gi = smooth_edge(gi, 48)
     out = y.astype(np.float32).copy()
     for ch in range(out.shape[1]):
         out[:, ch] *= gi.astype(np.float32)
@@ -289,32 +290,14 @@ def air(y, sr=SR, db=1.2) -> np.ndarray:
 
 
 def _apply_eq(y, sr, curve_db, n_fft=4096, hop=1024):
-    out = y.astype(np.float32).copy()
-    gain = 10 ** (curve_db / 20.0)
-    win = np.hanning(n_fft).astype(np.float32)
-    for ch in range(y.shape[1]):
-        x = out[:, ch]
-        if len(x) < n_fft * 2:
-            continue
-        frames = np.lib.stride_tricks.sliding_window_view(x, n_fft)[::hop]
-        spec = np.fft.rfft(frames * win, axis=1) * gain[None, :]
-        rec = np.fft.irfft(spec, n=n_fft, axis=1).astype(np.float32)
-        acc = np.zeros(len(x) + n_fft, dtype=np.float32)
-        nrm = np.zeros(len(x) + n_fft, dtype=np.float32)
-        for i, f in enumerate(rec):
-            a = i * hop
-            acc[a:a + n_fft] += f * win
-            nrm[a:a + n_fft] += win ** 2
-        out[:, ch] = (acc / np.maximum(nrm, 1e-6))[: len(x)]
-    peak = float(np.max(np.abs(out))) if out.size else 0.0
-    if peak > 0.999:
-        out *= 0.999 / peak
-    return out
+    from audio_dsp_safe import spectral_gain
+    return spectral_gain(y, 10 ** (curve_db / 20.0), n_fft, hop)
+
 
 
 # ---------------------------------------------------------------- 통합
 def polish_star(input_path, output_path, preset="ballad", intensity=1.0,
-                report_path=None) -> dict:
+                report_path=None, preserve_melody=True) -> dict:
     """가수처럼 들리게 만드는 전체 체인. 실제 적용 내역과 전/후 지표를 남긴다."""
     cfg = dict(PRESETS.get(preset, PRESETS["ballad"]))
     k = max(0.0, min(1.5, float(intensity)))
@@ -324,8 +307,11 @@ def polish_star(input_path, output_path, preset="ballad", intensity=1.0,
     before = vocal_health(y)
     stages = []
 
-    y, st = pitch_style(y, SR, drift=cfg["drift"] * k, rate=cfg["rate"],
-                        depth_cents=cfg["depth"] * k, delay=cfg["delay"])
+    if preserve_melody:
+        st = {"applied": False, "reason": "원곡 음정/비브라토 보존 (재합성 피치 변조 안 함)"}
+    else:
+        y, st = pitch_style(y, SR, drift=cfg["drift"] * k, rate=cfg["rate"],
+                            depth_cents=cfg["depth"] * k, delay=cfg["delay"])
     stages.append({"stage": "pitch_style", **st})
 
     y, st = phrase_dynamics(y, SR, cfg["dyn"] * k)

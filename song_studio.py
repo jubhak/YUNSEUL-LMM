@@ -37,7 +37,7 @@ CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
 BASE_DIR = Path(__file__).resolve().parent
 FINALIZE_SCRIPT = BASE_DIR / "song_finalize.py"
 POLISH_OPTIONS = [("부드럽게 다듬기 (추천)", "natural"), ("아주 부드럽게", "soft"),
-                  ("풍성하게 (두 테이크 겹침)", "rich"), ("다듬지 않기", "off")]
+                  ("풍성하게 (단일 보컬 유지)", "rich"), ("다듬지 않기", "off")]
 
 TEMPO_FACTOR = {"느리게": 0.88, "보통": 1.0, "빠르게": 1.12}
 FORMS = [("짧게 · 1절 + 후렴", 60), ("보통 · 2절 + 후렴 두 번", 120), ("풀버전 · 브릿지 + 마지막 후렴", 180)]
@@ -139,15 +139,16 @@ class LyricsWorker(QThread):
     progress = pyqtSignal(str)
     finished = pyqtSignal(bool, str, str)
 
-    def __init__(self, port, model, feeling, genre_key, duration, extra):
+    def __init__(self, port, model, feeling, genre_key, duration, extra, provider="gemini", api_key=None, gemini_model=None):
         super().__init__()
         self.args = (port, model, feeling, genre_key, duration, extra)
+        self.provider_options = dict(provider=provider, api_key=api_key, gemini_model=gemini_model)
 
     def run(self):
         port, model, feeling, genre_key, duration, extra = self.args
         try:
             lyrics = generate_lyrics(feeling, genre_key, duration=duration, model=model, port=port,
-                                     extra=extra, log=self.progress.emit)
+                                     extra=extra, log=self.progress.emit, **self.provider_options)
             self.finished.emit(True, lyrics, "")
         except Exception as e:  # noqa: BLE001
             self.finished.emit(False, "", str(e))
@@ -432,8 +433,8 @@ class SongStudio(QWidget):
         for label, val in SINGER_STYLES:
             self.combo_singer_style.addItem(label, val)
         self.combo_singer_style.setToolTip(
-            "비브라토·프레이즈 다이나믹·싱어 포먼트를 적용해 실제 가수처럼 만듭니다.\n"
-            "(VibE-SVC / ICASSP 2022 비브라토 모델링 / Roebel 2012 여기 성분 변조 기반)")
+            "분리된 보컬에 프레이즈·음색을 완만하게 보정합니다.\n"
+            "원곡 음정과 비브라토는 보존합니다. Demucs 또는 별도 보컬 스템이 필요합니다.")
         lay.addWidget(self.combo_singer_style)
         self.combo_coach = QComboBox()
         for label, val in [("다듬기 없이", 0.0), ("살짝", 0.6), ("보통 (추천)", 1.0), ("강하게", 1.3)]:
@@ -446,15 +447,15 @@ class SongStudio(QWidget):
         for n in (1, 2, 3):
             self.combo_takes.addItem(f"{n}개" + (" (추천)" if n == 2 else ""), n)
         self.combo_takes.setCurrentIndex(1)
-        self.combo_takes.setToolTip("여러 버전을 만들어 가사가 가장 또렷하게 들리는 것을 자동으로 고릅니다.\n버전이 많을수록 오래 걸립니다.")
+        self.combo_takes.setToolTip("여러 버전에서 정상 음원 판정·급격한 에너지 끊김·가사 정렬 점수를 비교합니다.\n화자 동일성 검사는 아니므로 최종 청음이 필요합니다. 버전이 많을수록 오래 걸립니다.")
         lay.addWidget(self.combo_takes)
 
         lay.addWidget(_label("보컬 다듬기", "h2"))
         self.combo_polish = QComboBox()
         for label, val in POLISH_OPTIONS:
             self.combo_polish.addItem(label, val)
-        self.combo_polish.setToolTip("레가토·피치 흔들림 보정·리버브·라우드니스 마스터링을 적용합니다.\n"
-                                     "'풍성하게'는 두 번째 테이크를 낮게 겹쳐 두께를 더합니다.")
+        self.combo_polish.setToolTip("보컬 스템에 레가토·음색·공간감을 적용합니다. 피치 강제 변조는 하지 않습니다.\n"
+                                     "독립 테이크는 겹치지 않으며, 코치 적용 시 중복 후처리를 건너뜁니다.")
         lay.addWidget(self.combo_polish)
 
         self.chk_lyrics_tag = QCheckBox("mp3 에 가사·동기화 가사 넣기")
@@ -518,6 +519,19 @@ class SongStudio(QWidget):
             "어떤 이야기를, 어떤 마음으로 부르는 노래인가요? 자유롭게 적어주세요.\n"
             "예) 이별 후 1년, 그 사람이 좋아하던 카페 앞을 지나며 이제는 웃으며 보내주는 마음")
         lay.addWidget(self.edit_idea)
+        provider_row = QHBoxLayout()
+        self.combo_lyrics_provider = QComboBox()
+        self.combo_lyrics_provider.addItem("Gemini API 작사", "gemini")
+        self.combo_lyrics_provider.addItem("로컬 Ollama 작사", "ollama")
+        provider_row.addWidget(self.combo_lyrics_provider)
+        self.edit_gemini_key = QLineEdit()
+        self.edit_gemini_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.edit_gemini_key.setPlaceholderText("Gemini API 키 (디스크 저장 안 함 / 환경변수 지원)")
+        provider_row.addWidget(self.edit_gemini_key, 1)
+        self.edit_gemini_model = QLineEdit(os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"))
+        self.edit_gemini_model.setToolTip("사용 가능한 Gemini 모델 ID. 가사 주제와 초안은 Google API로 전송됩니다.")
+        provider_row.addWidget(self.edit_gemini_model)
+        lay.addLayout(provider_row)
 
         row = QHBoxLayout()
         self.btn_lyrics = QPushButton("✨ 가사 만들기")
@@ -810,20 +824,27 @@ class SongStudio(QWidget):
         if self.edit_lyrics.toPlainText().strip():
             if QMessageBox.question(self, "가사 새로 만들기", "지금 가사를 새 가사로 바꿀까요?") != QMessageBox.StandardButton.Yes:
                 return
-        if not self._ollama_alive():
+        provider = self.combo_lyrics_provider.currentData()
+        if provider == "gemini" and not (self.edit_gemini_key.text().strip() or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")):
+            QMessageBox.warning(self, "Gemini 설정 필요", "API 키를 입력하거나 GEMINI_API_KEY 환경변수를 설정하세요.")
+            return
+        if provider == "ollama" and not self._ollama_alive():
             QMessageBox.warning(self, "글쓰기 AI 꺼짐", "가사를 쓰는 AI(Ollama)가 꺼져 있습니다.\n[⚡ 서버 & VRAM] 탭에서 서버를 켠 뒤 다시 눌러주세요.")
             return
-        ok, msg = self.host.check_vram_for_task("ebook")
-        if not ok:
-            QMessageBox.warning(self, "메모리 부족", msg)
-            return
+        if provider == "ollama":
+            ok, msg = self.host.check_vram_for_task("ebook")
+            if not ok:
+                QMessageBox.warning(self, "메모리 부족", msg)
+                return
         gender_ko = "여성" if self._gender() == "female" else "남성"
         extra = f"{gender_ko} 보컬이 부른다."
         if self._moods():
             extra += f" 분위기: {', '.join(self._moods())}."
         extra += f" 템포: {self._tempo()}."
         self.lyrics_worker = LyricsWorker(self.host.port, self.host.cfg.get("text_model", "qwen3:14b"), idea,
-                                          self._genre(), self.combo_form.currentData(), extra)
+                                          self._genre(), self.combo_form.currentData(), extra,
+                                          provider=provider, api_key=self.edit_gemini_key.text().strip(),
+                                          gemini_model=self.edit_gemini_model.text().strip())
         self.lyrics_worker.progress.connect(lambda m: self.lbl_lyrics_status.setText(m.strip()))
         self.lyrics_worker.finished.connect(self._on_lyrics_done)
         self.lbl_lyrics_status.setText("가사를 쓰는 중... (30초~1분)")
@@ -862,10 +883,16 @@ class SongStudio(QWidget):
         song_model = self.combo_song_model.currentData()
         song_model = song_model if isinstance(song_model, dict) and song_model.get("adapter_path") else None
 
-        caption = build_caption(self._genre(), builtin_gender or self._gender(),
-                               self._moods(), self.edit_extra.text())
-        if voice_lora and voice_lora.get("trigger_tag"):
-            caption = f"{voice_lora['trigger_tag']}, {caption}"
+        prof = (voice_lora.get("voice_profile") or {}) if voice_lora else {}
+        vocal_gender = builtin_gender or prof.get("gender_guess") or self._gender()
+        caption = build_caption(self._genre(), vocal_gender, self._moods(), self.edit_extra.text())
+        if voice_lora:
+            identity = ", ".join(x for x in (voice_lora.get("trigger_tag"), prof.get("caption_hint")) if x)
+            if identity:
+                caption = f"{identity}, {caption}"
+            caption += (", melodic sustained singing rather than spoken reading, connected vowels, "
+                        "supported breath, stable solo singer identity, smooth register transitions, "
+                        "preserve the song melody without matching speech pitch")
         if song_model and song_model.get("caption_hint"):
             caption = f"{caption}, {song_model['caption_hint']}"
         bpm = self._bpm()
@@ -886,11 +913,6 @@ class SongStudio(QWidget):
         if voice_lora:
             cmd += ["--lora-path", voice_lora["adapter_path"],
                     "--lora-scale", f"{self.combo_strength.currentData():.2f}"]
-            prof = voice_lora.get("voice_profile") or {}
-            if prof.get("caption_hint"):
-                caption = f"{voice_lora.get('trigger_tag', '')}, {prof['caption_hint']}, " \
-                          + build_caption(self._genre(), self._gender(), self._moods(), self.edit_extra.text())
-                prompt_file.write_text(caption, encoding="utf-8")
         if song_model:
             cmd += ["--style-lora-path", song_model["adapter_path"],
                     "--style-lora-scale", f"{self.combo_song_strength.currentData():.2f}"]
@@ -993,10 +1015,6 @@ class SongStudio(QWidget):
                 cmd += ["--profile", str(prof)]
         if want_video:
             cmd.append("--video")
-        if polish == "rich":
-            takes = sorted(Path(path).parent.glob(Path(path).stem + "_take*.mp3"))
-            if takes:
-                cmd += ["--double-track", str(takes[0])]
         return cmd
 
     def _start_finalize(self, path, meta=None) -> bool:
@@ -1026,7 +1044,8 @@ class SongStudio(QWidget):
         if ok:
             self.progress.setValue(1000)
             extra = []
-            jp = Path(str(target) + ".finalize.json") if target else None
+            jp = Path(target).with_suffix(".finalize.json") if target else None
+            warnings = []
             if jp and jp.exists():
                 try:
                     rep = json.loads(jp.read_text(encoding="utf-8"))
@@ -1036,11 +1055,13 @@ class SongStudio(QWidget):
                         extra.append("커버")
                     if rep.get("steps", {}).get("video", {}).get("path"):
                         extra.append("인트로 영상")
-                    if rep.get("warnings"):
-                        self.lbl_progress.setToolTip("\n".join(rep["warnings"][:6]))
+                    warnings = rep.get("warnings") or []
+                    if warnings:
+                        self.lbl_progress.setToolTip("\n".join(warnings[:6]))
                 except Exception:
                     pass
-            self.lbl_progress.setText("✅ 완성!" + (" (" + " · ".join(extra) + ")" if extra else ""))
+            self.lbl_progress.setText(("⚠️ 완료 (일부 단계 생략 — 상세 내용 확인)" if warnings else "✅ 완성!")
+                                      + (" (" + " · ".join(extra) + ")" if extra else ""))
             if target:
                 self.player.setSource(QUrl.fromLocalFile(str(target)))
         else:

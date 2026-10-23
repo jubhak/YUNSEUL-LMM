@@ -23,6 +23,10 @@ dist/
 *.exe
 *.zip
 
+# Secrets
+.env
+.env.*
+
 # Generated batch outputs & logs
 batch_out/
 *.log

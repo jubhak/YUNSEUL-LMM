@@ -26,6 +26,7 @@ if hasattr(sys.stderr, "reconfigure"):
 HERE = Path(__file__).resolve().parent
 ACESTEP_ROOT = HERE / "ACE-Step-1.5"
 sys.path.insert(0, str(ACESTEP_ROOT))
+sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(HERE))  # audio_verify
 
 TAG = "[acestep-official]"
@@ -222,6 +223,7 @@ def main() -> int:
         "dit_model": "acestep-v15-turbo", "steps": steps, "shift": args.shift,
         "duration_req": duration, "caption": caption, "lyrics_chars": len(lyrics),
         "bpm": args.bpm, "keyscale": args.keyscale, "candidates": candidates,
+        "continuity_screen": "mix_energy_only_not_speaker_verification",
         "lm_loaded": False, "lm_model": None, "lora_loaded": False,
     }
 
@@ -282,12 +284,17 @@ def main() -> int:
         ref = str(Path(args.ref_audio).resolve())
 
     has_lyrics = bool(lyrics.strip())
+    if has_lyrics:
+        caption += (", one consistent solo lead singer throughout, stable vocal timbre, "
+                    "smooth connected register transitions, preserve melodic contour, "
+                    "continuous accompaniment, balanced vocal level, no abrupt octave drops, no singer switching")
+    evidence["caption"] = caption  # actual prompt including continuity constraints
     params = GenerationParams(
         task_type=args.task_type,
         thinking=thinking,
         use_cot_metas=thinking,
         # 학습 어댑터의 트리거 태그가 LM 캡션 재작성으로 사라지지 않게 한다
-        use_cot_caption=thinking and not evidence["lora_loaded"],
+        use_cot_caption=False,  # keep identity and continuity instructions verbatim
         use_cot_language=False,
         caption=caption,
         lyrics=lyrics if has_lyrics else "",
@@ -337,6 +344,11 @@ def main() -> int:
             continue
         info = analyze(f)
         v, reasons = verdict(info)
+        try:
+            from vocal_pipeline import continuity_metrics
+            info["continuity"] = continuity_metrics(f)
+        except Exception as exc:
+            info["continuity"] = {"penalty": 0, "unavailable": str(exc)[:200]}
         takes.append({"idx": i, "path": f, "verdict": v, "reasons": reasons, "analysis": info,
                       "align": align[i] if i < len(align) else None, "seed": a.get("params", {}).get("seed")})
         log(f"  take {i + 1}: 판정={v} 가사정렬={takes[-1]['align']} rms={info['rms']:.3f} "
@@ -344,7 +356,7 @@ def main() -> int:
     if not takes:
         fail("생성된 음원 파일을 찾지 못했습니다.", 1)
 
-    takes.sort(key=lambda t: (t["verdict"] == "OK", t["align"] if t["align"] is not None else -1.0),
+    takes.sort(key=lambda t: (t["verdict"] == "OK", -t["analysis"].get("continuity", {}).get("penalty", 0), t["align"] if t["align"] is not None else -1.0),
                reverse=True)
     best = takes[0]
     v = best["verdict"]
@@ -352,7 +364,7 @@ def main() -> int:
         analysis=best["analysis"], verdict=v, verdict_reasons=best["reasons"],
         best_take=best["idx"] + 1, best_seed=best["seed"],
         lm_metadata=(getattr(result, "extra_outputs", {}) or {}).get("lm_metadata"),
-        takes=[{"take": t["idx"] + 1, "verdict": t["verdict"], "align": t["align"], "seed": t["seed"]}
+        takes=[{"take": t["idx"] + 1, "verdict": t["verdict"], "align": t["align"], "seed": t["seed"], "continuity": t["analysis"].get("continuity")}
                for t in takes],
     )
     log(f"최종 선택: take {best['idx'] + 1} (판정 {v}, 가사정렬 {best['align']})")

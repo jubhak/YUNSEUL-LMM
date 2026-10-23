@@ -13,6 +13,7 @@ import re
 from typing import Dict, List, Optional, Tuple
 
 from text_engine import ollama_generate, strip_thinking
+from gemini_lyrics import generate as gemini_generate
 
 GENRE_LYRIC_GUIDE: Dict[str, dict] = {
     "ballad_acoustic": {
@@ -121,7 +122,7 @@ GENRE_CAPTION = {
 # 화면에 보여줄 장르 순서 (그룹, 키)
 GENRE_MENU = [
     ("발라드", ["ballad_piano", "ballad_acoustic", "ballad_orchestral", "ballad_rnb", "ost_drama", "kpop_rock"]),
-    ("그 밖의 장르", ["indie_folk", "citypop", "kpop_rnb", "kpop_dance"]),
+    ("그 밖의 장르", ["trot", "indie_folk", "citypop", "kpop_rnb", "kpop_dance"]),
 ]
 
 MOOD_CAPTION = {
@@ -129,6 +130,14 @@ MOOD_CAPTION = {
     "따뜻한": "warm and tender", "설레는": "fluttering romantic", "희망찬": "hopeful uplifting", "웅장한": "epic and grand",
 }
 
+
+GENRE_LYRIC_GUIDE["trot"] = {
+    "name": "트로트", "bpm": 96, "keyscale": "A Minor", "syllables": (6, 10),
+    "tone": "구체적인 삶의 장면과 정감 있는 구어체. 구성진 리듬과 기억하기 쉬운 후렴. 억지 사투리와 상투어 남발 금지",
+    "english": "영어를 쓰지 않는다",
+    "tags": {"Intro": "Intro - accordion", "Bridge": "Bridge", "Final Chorus": "Final Chorus", "Outro": "Outro"},
+}
+GENRE_CAPTION["trot"] = "Korean trot, {vocal}, rhythmic phrasing, controlled ornamentation, accordion, warm band"
 
 def build_caption(genre_key: str, gender: str = "", moods=(), extra: str = "") -> str:
     vocal = f"{gender} vocals" if gender else "lead vocals"
@@ -387,6 +396,11 @@ def build_prompt(topic: str, guide: dict, form: str, extra: str = "") -> str:
 아래 섹션을 이 순서대로 한 번씩만 쓰세요. 태그 줄은 대괄호 그대로 쓰고, 괄호 안 설명은 출력하지 마세요.
 {spec}
 
+문장이 자연스러운 구어체인지 확인하고 조사 누락·번역투·뜬금없는 이미지 나열을 피하세요.
+주제의 구체적 장면 하나를 중심으로 시간·화자·감정을 일관되게 유지하세요.
+음절 수를 맞추려고 단어를 자르거나 의미 없는 어미를 붙이지 마세요. 자연스러운 의미가 우선입니다.
+기존 노래 가사를 인용하지 말고 독창적으로 쓰세요. 설명·평가·코드펜스는 출력하지 마세요.
+
 출력 예시 형식:
 [Verse 1]
 가사 줄
@@ -409,7 +423,16 @@ def _revise_prompt(raw_sections: Dict[str, List[str]], notes: List[str], form: s
 
 def generate_lyrics(topic: str, genre_key: str = "ballad_acoustic", duration: Optional[float] = None,
                     model: str = "qwen3:14b", port: int = 11434, candidates: int = 2,
-                    extra: str = "", log=print) -> str:
+                    extra: str = "", log=print, provider: str = "gemini",
+                    api_key: str = None, gemini_model: str = None) -> str:
+    if provider not in ("gemini", "ollama"):
+        raise ValueError("지원하지 않는 가사 공급자입니다.")
+    def generate(prompt, **kwargs):
+        if provider == "gemini":
+            return gemini_generate(prompt, api_key=api_key, model=gemini_model,
+                                   system=kwargs.get("system", LYRICIST_SYSTEM),
+                                   temperature=kwargs.get("temperature", 0.8))
+        return ollama_generate(prompt, **kwargs)
     guide = get_guide(genre_key)
     form = song_form(duration)
     prompt = build_prompt(topic, guide, form, extra)
@@ -419,7 +442,7 @@ def generate_lyrics(topic: str, genre_key: str = "ballad_acoustic", duration: Op
     best = None
     for i in range(max(1, candidates)):
         log(f"✍️ 가사 초안 {i + 1}/{candidates} 작성 중...")
-        raw = ollama_generate(prompt, model=model, port=port, system=LYRICIST_SYSTEM,
+        raw = generate(prompt, model=model, port=port, system=LYRICIST_SYSTEM,
                               max_tokens=1500, temperature=0.9, options=opts)
         secs = parse_sections(raw)
         sc, notes = score_sections(secs, form, guide)
@@ -428,9 +451,9 @@ def generate_lyrics(topic: str, genre_key: str = "ballad_acoustic", duration: Op
             best = (sc, secs, notes)
 
     sc, secs, notes = best
-    if notes and sc < 90:
+    if (notes and sc < 90) or provider == "gemini":
         log("🔧 지적 사항 퇴고 중...")
-        raw = ollama_generate(_revise_prompt(secs, notes, form, guide), model=model, port=port,
+        raw = generate(_revise_prompt(secs, notes + ["어색한 조사/번역투를 자연스럽게 고치고 주제와 화자, 장면의 인과관계를 점검"], form, guide), model=model, port=port,
                               system=LYRICIST_SYSTEM, max_tokens=1500, temperature=0.6, options=opts)
         new_secs = parse_sections(raw)
         new_sc, _ = score_sections(new_secs, form, guide)

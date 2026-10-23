@@ -1,0 +1,1731 @@
+diff --git a/.gitignore b/.gitignore
+index 390512f..ba31702 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -23,6 +23,10 @@ dist/
+ *.exe
+ *.zip
+ 
++# Secrets
++.env
++.env.*
++
+ # Generated batch outputs & logs
+ batch_out/
+ *.log
+diff --git a/YUNSEUL-LMM.spec b/YUNSEUL-LMM.spec
+index 7aecefc..0f25cb9 100644
+--- a/YUNSEUL-LMM.spec
++++ b/YUNSEUL-LMM.spec
+@@ -26,6 +26,11 @@ a = Analysis(
+         "mp3_meta",
+         "song_studio",
+         "lyrics_writer",
++        "gemini_lyrics",
++        "workspace_state",
++        "training_genres",
++        "vocal_pipeline",
++        "audio_dsp_safe",
+         "ebook_writer",
+         "ebook_persona",
+         "voice_catalog",
+diff --git a/audio_dsp_safe.py b/audio_dsp_safe.py
+new file mode 100644
+index 0000000..748f638
+--- /dev/null
++++ b/audio_dsp_safe.py
+@@ -0,0 +1,30 @@
++"""Boundary-safe overlap-add and envelope smoothing, preserving sample count."""
++import numpy as np
++
++
++def smooth_edge(x, width):
++    width = max(1, int(width))
++    if not len(x):
++        return x.copy()
++    left, right = width // 2, width - 1 - width // 2
++    return np.convolve(np.pad(x, (left, right), mode="edge"), np.ones(width) / width, mode="valid")
++
++
++def spectral_gain(y, gain, frame=4096, hop=1024):
++    """Centered, padded STFT. Unity gain round trips edges and fractional last hops."""
++    y = np.asarray(y, dtype=np.float32)
++    out = y.copy()
++    if not len(y):
++        return out
++    win = np.hanning(frame).astype(np.float64)
++    pad = frame
++    for ch in range(y.shape[1]):
++        x = np.pad(y[:, ch], (pad, pad + (-len(y) % hop)), mode="edge").astype(np.float64)
++        acc, norm = np.zeros(len(x)), np.zeros(len(x))
++        for a in range(0, len(x) - frame + 1, hop):
++            spec = np.fft.rfft(x[a:a+frame] * win)
++            rec = np.fft.irfft(spec * gain, n=frame)
++            acc[a:a+frame] += rec * win
++            norm[a:a+frame] += win ** 2
++        out[:, ch] = (acc / np.maximum(norm, 1e-12))[pad:pad+len(y)]
++    return out
+diff --git a/audio_engines/acestep_official_runner.py b/audio_engines/acestep_official_runner.py
+index be50f9b..eef7f90 100644
+--- a/audio_engines/acestep_official_runner.py
++++ b/audio_engines/acestep_official_runner.py
+@@ -26,6 +26,7 @@ if hasattr(sys.stderr, "reconfigure"):
+ HERE = Path(__file__).resolve().parent
+ ACESTEP_ROOT = HERE / "ACE-Step-1.5"
+ sys.path.insert(0, str(ACESTEP_ROOT))
++sys.path.insert(0, str(HERE.parent))
+ sys.path.insert(0, str(HERE))  # audio_verify
+ 
+ TAG = "[acestep-official]"
+@@ -222,6 +223,7 @@ def main() -> int:
+         "dit_model": "acestep-v15-turbo", "steps": steps, "shift": args.shift,
+         "duration_req": duration, "caption": caption, "lyrics_chars": len(lyrics),
+         "bpm": args.bpm, "keyscale": args.keyscale, "candidates": candidates,
++        "continuity_screen": "mix_energy_only_not_speaker_verification",
+         "lm_loaded": False, "lm_model": None, "lora_loaded": False,
+     }
+ 
+@@ -282,12 +284,17 @@ def main() -> int:
+         ref = str(Path(args.ref_audio).resolve())
+ 
+     has_lyrics = bool(lyrics.strip())
++    if has_lyrics:
++        caption += (", one consistent solo lead singer throughout, stable vocal timbre, "
++                    "smooth connected register transitions, preserve melodic contour, "
++                    "continuous accompaniment, balanced vocal level, no abrupt octave drops, no singer switching")
++    evidence["caption"] = caption  # actual prompt including continuity constraints
+     params = GenerationParams(
+         task_type=args.task_type,
+         thinking=thinking,
+         use_cot_metas=thinking,
+         # 학습 어댑터의 트리거 태그가 LM 캡션 재작성으로 사라지지 않게 한다
+-        use_cot_caption=thinking and not evidence["lora_loaded"],
++        use_cot_caption=False,  # keep identity and continuity instructions verbatim
+         use_cot_language=False,
+         caption=caption,
+         lyrics=lyrics if has_lyrics else "",
+@@ -337,6 +344,11 @@ def main() -> int:
+             continue
+         info = analyze(f)
+         v, reasons = verdict(info)
++        try:
++            from vocal_pipeline import continuity_metrics
++            info["continuity"] = continuity_metrics(f)
++        except Exception as exc:
++            info["continuity"] = {"penalty": 0, "unavailable": str(exc)[:200]}
+         takes.append({"idx": i, "path": f, "verdict": v, "reasons": reasons, "analysis": info,
+                       "align": align[i] if i < len(align) else None, "seed": a.get("params", {}).get("seed")})
+         log(f"  take {i + 1}: 판정={v} 가사정렬={takes[-1]['align']} rms={info['rms']:.3f} "
+@@ -344,7 +356,7 @@ def main() -> int:
+     if not takes:
+         fail("생성된 음원 파일을 찾지 못했습니다.", 1)
+ 
+-    takes.sort(key=lambda t: (t["verdict"] == "OK", t["align"] if t["align"] is not None else -1.0),
++    takes.sort(key=lambda t: (t["verdict"] == "OK", -t["analysis"].get("continuity", {}).get("penalty", 0), t["align"] if t["align"] is not None else -1.0),
+                reverse=True)
+     best = takes[0]
+     v = best["verdict"]
+@@ -352,7 +364,7 @@ def main() -> int:
+         analysis=best["analysis"], verdict=v, verdict_reasons=best["reasons"],
+         best_take=best["idx"] + 1, best_seed=best["seed"],
+         lm_metadata=(getattr(result, "extra_outputs", {}) or {}).get("lm_metadata"),
+-        takes=[{"take": t["idx"] + 1, "verdict": t["verdict"], "align": t["align"], "seed": t["seed"]}
++        takes=[{"take": t["idx"] + 1, "verdict": t["verdict"], "align": t["align"], "seed": t["seed"], "continuity": t["analysis"].get("continuity")}
+                for t in takes],
+     )
+     log(f"최종 선택: take {best['idx'] + 1} (판정 {v}, 가사정렬 {best['align']})")
+diff --git a/gemini_lyrics.py b/gemini_lyrics.py
+new file mode 100644
+index 0000000..4ef1d68
+--- /dev/null
++++ b/gemini_lyrics.py
+@@ -0,0 +1,51 @@
++"""Gemini REST lyric client. Keys are never persisted or included in URLs/errors."""
++import json
++import os
++import time
++import urllib.error
++import urllib.request
++import re
++
++DEFAULT_MODEL = "gemini-2.5-flash"
++
++
++def generate(prompt, system, api_key=None, model=None, temperature=0.8, **_):
++    key = (api_key or os.environ.get("GEMINI_API_KEY") or
++           os.environ.get("GOOGLE_API_KEY") or "").strip()
++    if not key:
++        raise RuntimeError("Gemini API 키를 입력하거나 GEMINI_API_KEY 환경변수를 설정하세요.")
++    model = (model or os.environ.get("GEMINI_MODEL") or DEFAULT_MODEL).removeprefix("models/")
++    if not re.fullmatch(r"[A-Za-z0-9._-]+", model):
++        raise ValueError("Gemini 모델 이름 형식이 올바르지 않습니다.")
++    body = json.dumps({
++        "systemInstruction": {"parts": [{"text": system}]},
++        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
++        "generationConfig": {"temperature": temperature, "maxOutputTokens": 8192},
++    }).encode("utf-8")
++    req = urllib.request.Request(
++        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
++        data=body, headers={"Content-Type": "application/json", "x-goog-api-key": key})
++    for attempt in range(3):
++        try:
++            with urllib.request.urlopen(req, timeout=120) as response:
++                result = json.load(response)
++            break
++        except urllib.error.HTTPError as exc:
++            if exc.code in (429, 500, 502, 503, 504) and attempt < 2:
++                time.sleep(2 ** attempt)
++                continue
++            messages = {400: "요청 또는 모델 설정 확인", 401: "API 키 인증 실패",
++                        403: "API 키 권한 확인", 404: "사용 가능한 모델 이름 확인",
++                        429: "요청 한도 초과. 잠시 후 다시 시도"}
++            raise RuntimeError(f"Gemini HTTP {exc.code}: {messages.get(exc.code, '서비스 오류')}") from None
++        except (urllib.error.URLError, TimeoutError):
++            raise RuntimeError("Gemini 연결 실패: 네트워크 연결을 확인하세요.") from None
++    candidates = result.get("candidates") or []
++    candidate = candidates[0] if candidates else {}
++    if candidate.get("finishReason") not in (None, "STOP"):
++        raise RuntimeError("Gemini 응답이 중단되었습니다. 주제나 출력 분량을 조정하세요.")
++    parts = candidate.get("content", {}).get("parts", [])
++    text = "\n".join(p.get("text", "") for p in parts if not p.get("thought")).strip()
++    if not text:
++        raise RuntimeError("Gemini에서 가사를 받지 못했습니다. 안전 차단 또는 빈 응답입니다.")
++    return text
+diff --git a/lyrics_writer.py b/lyrics_writer.py
+index de6598d..911f49e 100644
+--- a/lyrics_writer.py
++++ b/lyrics_writer.py
+@@ -13,6 +13,7 @@ import re
+ from typing import Dict, List, Optional, Tuple
+ 
+ from text_engine import ollama_generate, strip_thinking
++from gemini_lyrics import generate as gemini_generate
+ 
+ GENRE_LYRIC_GUIDE: Dict[str, dict] = {
+     "ballad_acoustic": {
+@@ -121,7 +122,7 @@ GENRE_CAPTION = {
+ # 화면에 보여줄 장르 순서 (그룹, 키)
+ GENRE_MENU = [
+     ("발라드", ["ballad_piano", "ballad_acoustic", "ballad_orchestral", "ballad_rnb", "ost_drama", "kpop_rock"]),
+-    ("그 밖의 장르", ["indie_folk", "citypop", "kpop_rnb", "kpop_dance"]),
++    ("그 밖의 장르", ["trot", "indie_folk", "citypop", "kpop_rnb", "kpop_dance"]),
+ ]
+ 
+ MOOD_CAPTION = {
+@@ -130,6 +131,14 @@ MOOD_CAPTION = {
+ }
+ 
+ 
++GENRE_LYRIC_GUIDE["trot"] = {
++    "name": "트로트", "bpm": 96, "keyscale": "A Minor", "syllables": (6, 10),
++    "tone": "구체적인 삶의 장면과 정감 있는 구어체. 구성진 리듬과 기억하기 쉬운 후렴. 억지 사투리와 상투어 남발 금지",
++    "english": "영어를 쓰지 않는다",
++    "tags": {"Intro": "Intro - accordion", "Bridge": "Bridge", "Final Chorus": "Final Chorus", "Outro": "Outro"},
++}
++GENRE_CAPTION["trot"] = "Korean trot, {vocal}, rhythmic phrasing, controlled ornamentation, accordion, warm band"
++
+ def build_caption(genre_key: str, gender: str = "", moods=(), extra: str = "") -> str:
+     vocal = f"{gender} vocals" if gender else "lead vocals"
+     cap = GENRE_CAPTION.get(genre_key, GENRE_CAPTION["custom"]).format(vocal=vocal)
+@@ -387,6 +396,11 @@ def build_prompt(topic: str, guide: dict, form: str, extra: str = "") -> str:
+ 아래 섹션을 이 순서대로 한 번씩만 쓰세요. 태그 줄은 대괄호 그대로 쓰고, 괄호 안 설명은 출력하지 마세요.
+ {spec}
+ 
++문장이 자연스러운 구어체인지 확인하고 조사 누락·번역투·뜬금없는 이미지 나열을 피하세요.
++주제의 구체적 장면 하나를 중심으로 시간·화자·감정을 일관되게 유지하세요.
++음절 수를 맞추려고 단어를 자르거나 의미 없는 어미를 붙이지 마세요. 자연스러운 의미가 우선입니다.
++기존 노래 가사를 인용하지 말고 독창적으로 쓰세요. 설명·평가·코드펜스는 출력하지 마세요.
++
+ 출력 예시 형식:
+ [Verse 1]
+ 가사 줄
+@@ -409,7 +423,16 @@ def _revise_prompt(raw_sections: Dict[str, List[str]], notes: List[str], form: s
+ 
+ def generate_lyrics(topic: str, genre_key: str = "ballad_acoustic", duration: Optional[float] = None,
+                     model: str = "qwen3:14b", port: int = 11434, candidates: int = 2,
+-                    extra: str = "", log=print) -> str:
++                    extra: str = "", log=print, provider: str = "gemini",
++                    api_key: str = None, gemini_model: str = None) -> str:
++    if provider not in ("gemini", "ollama"):
++        raise ValueError("지원하지 않는 가사 공급자입니다.")
++    def generate(prompt, **kwargs):
++        if provider == "gemini":
++            return gemini_generate(prompt, api_key=api_key, model=gemini_model,
++                                   system=kwargs.get("system", LYRICIST_SYSTEM),
++                                   temperature=kwargs.get("temperature", 0.8))
++        return ollama_generate(prompt, **kwargs)
+     guide = get_guide(genre_key)
+     form = song_form(duration)
+     prompt = build_prompt(topic, guide, form, extra)
+@@ -419,7 +442,7 @@ def generate_lyrics(topic: str, genre_key: str = "ballad_acoustic", duration: Op
+     best = None
+     for i in range(max(1, candidates)):
+         log(f"✍️ 가사 초안 {i + 1}/{candidates} 작성 중...")
+-        raw = ollama_generate(prompt, model=model, port=port, system=LYRICIST_SYSTEM,
++        raw = generate(prompt, model=model, port=port, system=LYRICIST_SYSTEM,
+                               max_tokens=1500, temperature=0.9, options=opts)
+         secs = parse_sections(raw)
+         sc, notes = score_sections(secs, form, guide)
+@@ -428,9 +451,9 @@ def generate_lyrics(topic: str, genre_key: str = "ballad_acoustic", duration: Op
+             best = (sc, secs, notes)
+ 
+     sc, secs, notes = best
+-    if notes and sc < 90:
++    if (notes and sc < 90) or provider == "gemini":
+         log("🔧 지적 사항 퇴고 중...")
+-        raw = ollama_generate(_revise_prompt(secs, notes, form, guide), model=model, port=port,
++        raw = generate(_revise_prompt(secs, notes + ["어색한 조사/번역투를 자연스럽게 고치고 주제와 화자, 장면의 인과관계를 점검"], form, guide), model=model, port=port,
+                               system=LYRICIST_SYSTEM, max_tokens=1500, temperature=0.6, options=opts)
+         new_secs = parse_sections(raw)
+         new_sc, _ = score_sections(new_secs, form, guide)
+diff --git a/song_finalize.py b/song_finalize.py
+index 22ee56c..797dd7e 100644
+--- a/song_finalize.py
++++ b/song_finalize.py
+@@ -52,6 +52,8 @@ def main() -> int:
+     ap.add_argument("--genre", default="ballad_piano")
+     ap.add_argument("--genre-name", default="")
+     ap.add_argument("--moods", nargs="*", default=[])
++    ap.add_argument("--vocal-stem", default=None, help="분리된 보컬 WAV (반주와 함께 지정)")
++    ap.add_argument("--instrumental-stem", default=None, help="분리된 반주 WAV")
+     ap.add_argument("--profile", default=None, help="voice_profile.json 경로")
+     ap.add_argument("--svc-backend", default="auto", choices=["auto", "rvc", "dsp", "off"])
+     ap.add_argument("--polish", default="natural", choices=["off", "soft", "natural", "rich"])
+@@ -80,8 +82,22 @@ def main() -> int:
+     tmpdir = Path(tempfile.mkdtemp(prefix="finalize_"))
+     stage_in = src
+ 
++    from vocal_pipeline import prepare_stems, remix
++    vocal_stem = backing_stem = None
++    try:
++        vocal_stem, backing_stem = prepare_stems(src, tmpdir, args.vocal_stem, args.instrumental_stem)
++        if vocal_stem:
++            stage_in = vocal_stem
++            report["steps"]["separation"] = {"vocal": str(vocal_stem), "backing": str(backing_stem)}
++        else:
++            report["warnings"].append("Demucs/보컬 스템 없음: 반주 보호를 위해 음색 변환·보컬 코치를 건너뜁니다.")
++    except Exception as exc:
++        report["warnings"].append(f"보컬 분리 실패: 원본 보존 ({exc})")
++    vocal_ready = vocal_stem is not None and backing_stem is not None
++    report["steps"].setdefault("separation", {"skipped": True})
++
+     # ---------------------------------------------------------------- 1) SV C
+-    if args.profile and args.svc_backend != "off" and Path(args.profile).exists():
++    if vocal_ready and args.profile and args.svc_backend != "off" and Path(args.profile).exists():
+         progress(10, "내 목소리 음색으로 변환 중...")
+         try:
+             import svc  # 같은 폴더
+@@ -103,14 +119,14 @@ def main() -> int:
+     # ---------------------------------------------------------------- 2) 다듬기
+     # 2a) 가수 코치: 비브라토·프레이즈 다이내믹·싱어 포먼트 (근거: VibE-SVC 2025,
+     #     ICASSP 2022 비브라토 모델링, Roebel ICASSP 2012 여기 성분 변조)
+-    if args.singer_intensity and args.singer_intensity > 0:
+-        progress(30, "가수처럼 다듬는 중 (비브라토·다이내믹·싱어포먼트)...")
++    if vocal_ready and args.singer_intensity and args.singer_intensity > 0:
++        progress(30, "보컬 다듬는 중 (원곡 음정 보존·다이내믹·음색)...")
+         try:
+             import vocal_coach
+-            out_star = tmpdir / "star.mp3"
++            out_star = tmpdir / "star.wav"
+             r = vocal_coach.polish_star(str(stage_in), str(out_star),
+                                         preset=args.singer_style,
+-                                        intensity=args.singer_intensity)
++                                        intensity=args.singer_intensity, preserve_melody=True)
+             stage_in = out_star
+             report["steps"]["singer_coach"] = {
+                 "preset": args.singer_style, "intensity": args.singer_intensity,
+@@ -127,15 +143,16 @@ def main() -> int:
+     else:
+         report["steps"]["singer_coach"] = {"skipped": True}
+ 
+-    if args.polish != "off":
+-        progress(35, "부드럽게 다듬는 중 (레가토·피치·리버브·마스터)...")
++    coach_result = report["steps"].get("singer_coach", {})
++    coach_not_applied = bool(coach_result.get("error") or coach_result.get("skipped"))
++    if vocal_ready and args.polish != "off" and coach_not_applied:
++        progress(35, "부드럽게 다듬는 중 (음정 보존·레가토·리버브)...")
+         try:
+             import vocal_post
+-            out2 = tmpdir / "polished.mp3"
+-            # 가수 코치를 이미 적용했다면 거친 대역/레가토/리버브/마스터만 다시 한다
++            out2 = tmpdir / "polished.wav"
++            # 코치 체인을 적용했으면 중복 EQ/리버브/압축은 하지 않는다
+             r = vocal_post.polish_song(str(stage_in), str(out2), preset=args.polish,
+-                                       double_track_path=args.double_track,
+-                                       pitch=not (args.singer_intensity and args.singer_intensity > 0))
++                                       double_track_path=None, pitch=False)
+             stage_in = out2
+             report["steps"]["polish"] = r
+             log(f"• 다듬기({args.polish}) 완료 · 단계 {', '.join(r.get('stages', []))}")
+@@ -149,11 +166,24 @@ def main() -> int:
+     else:
+         report["steps"]["polish"] = {"skipped": True}
+ 
++    if vocal_ready:
++        try:
++            remixed = tmpdir / "remixed.wav"
++            report["steps"]["remix"] = remix(stage_in, vocal_stem, backing_stem, remixed)
++            stage_in = remixed
++        except Exception as exc:
++            stage_in = src
++            report["warnings"].append(f"리믹스 실패: 원본 사용 ({exc})")
++    if args.double_track:
++        report["warnings"].append("독립 테이크 겹치기는 화자/박자 불일치를 유발할 수 있어 적용하지 않았습니다.")
++
+     # 최종 오디오 확정 (mp3 로 통일)
+     final_audio = tmpdir / "final.mp3"
+     try:
+         ff = shutil.which("ffmpeg")
+-        if ff:
++        if stage_in == src and src.suffix.lower() == ".mp3":
++            shutil.copy2(src, final_audio)
++        elif ff:
+             subprocess.run([ff, "-y", "-v", "error", "-i", str(stage_in), "-c:a", "libmp3lame",
+                             "-b:a", "320k", str(final_audio)], check=True)
+         else:
+diff --git a/song_studio.py b/song_studio.py
+index d837204..f4447ac 100644
+--- a/song_studio.py
++++ b/song_studio.py
+@@ -37,7 +37,7 @@ CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+ BASE_DIR = Path(__file__).resolve().parent
+ FINALIZE_SCRIPT = BASE_DIR / "song_finalize.py"
+ POLISH_OPTIONS = [("부드럽게 다듬기 (추천)", "natural"), ("아주 부드럽게", "soft"),
+-                  ("풍성하게 (두 테이크 겹침)", "rich"), ("다듬지 않기", "off")]
++                  ("풍성하게 (단일 보컬 유지)", "rich"), ("다듬지 않기", "off")]
+ 
+ TEMPO_FACTOR = {"느리게": 0.88, "보통": 1.0, "빠르게": 1.12}
+ FORMS = [("짧게 · 1절 + 후렴", 60), ("보통 · 2절 + 후렴 두 번", 120), ("풀버전 · 브릿지 + 마지막 후렴", 180)]
+@@ -139,15 +139,16 @@ class LyricsWorker(QThread):
+     progress = pyqtSignal(str)
+     finished = pyqtSignal(bool, str, str)
+ 
+-    def __init__(self, port, model, feeling, genre_key, duration, extra):
++    def __init__(self, port, model, feeling, genre_key, duration, extra, provider="gemini", api_key=None, gemini_model=None):
+         super().__init__()
+         self.args = (port, model, feeling, genre_key, duration, extra)
++        self.provider_options = dict(provider=provider, api_key=api_key, gemini_model=gemini_model)
+ 
+     def run(self):
+         port, model, feeling, genre_key, duration, extra = self.args
+         try:
+             lyrics = generate_lyrics(feeling, genre_key, duration=duration, model=model, port=port,
+-                                     extra=extra, log=self.progress.emit)
++                                     extra=extra, log=self.progress.emit, **self.provider_options)
+             self.finished.emit(True, lyrics, "")
+         except Exception as e:  # noqa: BLE001
+             self.finished.emit(False, "", str(e))
+@@ -432,8 +433,8 @@ class SongStudio(QWidget):
+         for label, val in SINGER_STYLES:
+             self.combo_singer_style.addItem(label, val)
+         self.combo_singer_style.setToolTip(
+-            "비브라토·프레이즈 다이나믹·싱어 포먼트를 적용해 실제 가수처럼 만듭니다.\n"
+-            "(VibE-SVC / ICASSP 2022 비브라토 모델링 / Roebel 2012 여기 성분 변조 기반)")
++            "분리된 보컬에 프레이즈·음색을 완만하게 보정합니다.\n"
++            "원곡 음정과 비브라토는 보존합니다. Demucs 또는 별도 보컬 스템이 필요합니다.")
+         lay.addWidget(self.combo_singer_style)
+         self.combo_coach = QComboBox()
+         for label, val in [("다듬기 없이", 0.0), ("살짝", 0.6), ("보통 (추천)", 1.0), ("강하게", 1.3)]:
+@@ -446,15 +447,15 @@ class SongStudio(QWidget):
+         for n in (1, 2, 3):
+             self.combo_takes.addItem(f"{n}개" + (" (추천)" if n == 2 else ""), n)
+         self.combo_takes.setCurrentIndex(1)
+-        self.combo_takes.setToolTip("여러 버전을 만들어 가사가 가장 또렷하게 들리는 것을 자동으로 고릅니다.\n버전이 많을수록 오래 걸립니다.")
++        self.combo_takes.setToolTip("여러 버전에서 정상 음원 판정·급격한 에너지 끊김·가사 정렬 점수를 비교합니다.\n화자 동일성 검사는 아니므로 최종 청음이 필요합니다. 버전이 많을수록 오래 걸립니다.")
+         lay.addWidget(self.combo_takes)
+ 
+         lay.addWidget(_label("보컬 다듬기", "h2"))
+         self.combo_polish = QComboBox()
+         for label, val in POLISH_OPTIONS:
+             self.combo_polish.addItem(label, val)
+-        self.combo_polish.setToolTip("레가토·피치 흔들림 보정·리버브·라우드니스 마스터링을 적용합니다.\n"
+-                                     "'풍성하게'는 두 번째 테이크를 낮게 겹쳐 두께를 더합니다.")
++        self.combo_polish.setToolTip("보컬 스템에 레가토·음색·공간감을 적용합니다. 피치 강제 변조는 하지 않습니다.\n"
++                                     "독립 테이크는 겹치지 않으며, 코치 적용 시 중복 후처리를 건너뜁니다.")
+         lay.addWidget(self.combo_polish)
+ 
+         self.chk_lyrics_tag = QCheckBox("mp3 에 가사·동기화 가사 넣기")
+@@ -518,6 +519,19 @@ class SongStudio(QWidget):
+             "어떤 이야기를, 어떤 마음으로 부르는 노래인가요? 자유롭게 적어주세요.\n"
+             "예) 이별 후 1년, 그 사람이 좋아하던 카페 앞을 지나며 이제는 웃으며 보내주는 마음")
+         lay.addWidget(self.edit_idea)
++        provider_row = QHBoxLayout()
++        self.combo_lyrics_provider = QComboBox()
++        self.combo_lyrics_provider.addItem("Gemini API 작사", "gemini")
++        self.combo_lyrics_provider.addItem("로컬 Ollama 작사", "ollama")
++        provider_row.addWidget(self.combo_lyrics_provider)
++        self.edit_gemini_key = QLineEdit()
++        self.edit_gemini_key.setEchoMode(QLineEdit.EchoMode.Password)
++        self.edit_gemini_key.setPlaceholderText("Gemini API 키 (디스크 저장 안 함 / 환경변수 지원)")
++        provider_row.addWidget(self.edit_gemini_key, 1)
++        self.edit_gemini_model = QLineEdit(os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"))
++        self.edit_gemini_model.setToolTip("사용 가능한 Gemini 모델 ID. 가사 주제와 초안은 Google API로 전송됩니다.")
++        provider_row.addWidget(self.edit_gemini_model)
++        lay.addLayout(provider_row)
+ 
+         row = QHBoxLayout()
+         self.btn_lyrics = QPushButton("✨ 가사 만들기")
+@@ -810,20 +824,27 @@ class SongStudio(QWidget):
+         if self.edit_lyrics.toPlainText().strip():
+             if QMessageBox.question(self, "가사 새로 만들기", "지금 가사를 새 가사로 바꿀까요?") != QMessageBox.StandardButton.Yes:
+                 return
+-        if not self._ollama_alive():
+-            QMessageBox.warning(self, "글쓰기 AI 꺼짐", "가사를 쓰는 AI(Ollama)가 꺼져 있습니다.\n[⚡ 서버 & VRAM] 탭에서 서버를 켠 뒤 다시 눌러주세요.")
++        provider = self.combo_lyrics_provider.currentData()
++        if provider == "gemini" and not (self.edit_gemini_key.text().strip() or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")):
++            QMessageBox.warning(self, "Gemini 설정 필요", "API 키를 입력하거나 GEMINI_API_KEY 환경변수를 설정하세요.")
+             return
+-        ok, msg = self.host.check_vram_for_task("ebook")
+-        if not ok:
+-            QMessageBox.warning(self, "메모리 부족", msg)
++        if provider == "ollama" and not self._ollama_alive():
++            QMessageBox.warning(self, "글쓰기 AI 꺼짐", "가사를 쓰는 AI(Ollama)가 꺼져 있습니다.\n[⚡ 서버 & VRAM] 탭에서 서버를 켠 뒤 다시 눌러주세요.")
+             return
++        if provider == "ollama":
++            ok, msg = self.host.check_vram_for_task("ebook")
++            if not ok:
++                QMessageBox.warning(self, "메모리 부족", msg)
++                return
+         gender_ko = "여성" if self._gender() == "female" else "남성"
+         extra = f"{gender_ko} 보컬이 부른다."
+         if self._moods():
+             extra += f" 분위기: {', '.join(self._moods())}."
+         extra += f" 템포: {self._tempo()}."
+         self.lyrics_worker = LyricsWorker(self.host.port, self.host.cfg.get("text_model", "qwen3:14b"), idea,
+-                                          self._genre(), self.combo_form.currentData(), extra)
++                                          self._genre(), self.combo_form.currentData(), extra,
++                                          provider=provider, api_key=self.edit_gemini_key.text().strip(),
++                                          gemini_model=self.edit_gemini_model.text().strip())
+         self.lyrics_worker.progress.connect(lambda m: self.lbl_lyrics_status.setText(m.strip()))
+         self.lyrics_worker.finished.connect(self._on_lyrics_done)
+         self.lbl_lyrics_status.setText("가사를 쓰는 중... (30초~1분)")
+@@ -862,10 +883,16 @@ class SongStudio(QWidget):
+         song_model = self.combo_song_model.currentData()
+         song_model = song_model if isinstance(song_model, dict) and song_model.get("adapter_path") else None
+ 
+-        caption = build_caption(self._genre(), builtin_gender or self._gender(),
+-                               self._moods(), self.edit_extra.text())
+-        if voice_lora and voice_lora.get("trigger_tag"):
+-            caption = f"{voice_lora['trigger_tag']}, {caption}"
++        prof = (voice_lora.get("voice_profile") or {}) if voice_lora else {}
++        vocal_gender = builtin_gender or prof.get("gender_guess") or self._gender()
++        caption = build_caption(self._genre(), vocal_gender, self._moods(), self.edit_extra.text())
++        if voice_lora:
++            identity = ", ".join(x for x in (voice_lora.get("trigger_tag"), prof.get("caption_hint")) if x)
++            if identity:
++                caption = f"{identity}, {caption}"
++            caption += (", melodic sustained singing rather than spoken reading, connected vowels, "
++                        "supported breath, stable solo singer identity, smooth register transitions, "
++                        "preserve the song melody without matching speech pitch")
+         if song_model and song_model.get("caption_hint"):
+             caption = f"{caption}, {song_model['caption_hint']}"
+         bpm = self._bpm()
+@@ -886,11 +913,6 @@ class SongStudio(QWidget):
+         if voice_lora:
+             cmd += ["--lora-path", voice_lora["adapter_path"],
+                     "--lora-scale", f"{self.combo_strength.currentData():.2f}"]
+-            prof = voice_lora.get("voice_profile") or {}
+-            if prof.get("caption_hint"):
+-                caption = f"{voice_lora.get('trigger_tag', '')}, {prof['caption_hint']}, " \
+-                          + build_caption(self._genre(), self._gender(), self._moods(), self.edit_extra.text())
+-                prompt_file.write_text(caption, encoding="utf-8")
+         if song_model:
+             cmd += ["--style-lora-path", song_model["adapter_path"],
+                     "--style-lora-scale", f"{self.combo_song_strength.currentData():.2f}"]
+@@ -993,10 +1015,6 @@ class SongStudio(QWidget):
+                 cmd += ["--profile", str(prof)]
+         if want_video:
+             cmd.append("--video")
+-        if polish == "rich":
+-            takes = sorted(Path(path).parent.glob(Path(path).stem + "_take*.mp3"))
+-            if takes:
+-                cmd += ["--double-track", str(takes[0])]
+         return cmd
+ 
+     def _start_finalize(self, path, meta=None) -> bool:
+@@ -1026,7 +1044,8 @@ class SongStudio(QWidget):
+         if ok:
+             self.progress.setValue(1000)
+             extra = []
+-            jp = Path(str(target) + ".finalize.json") if target else None
++            jp = Path(target).with_suffix(".finalize.json") if target else None
++            warnings = []
+             if jp and jp.exists():
+                 try:
+                     rep = json.loads(jp.read_text(encoding="utf-8"))
+@@ -1036,11 +1055,13 @@ class SongStudio(QWidget):
+                         extra.append("커버")
+                     if rep.get("steps", {}).get("video", {}).get("path"):
+                         extra.append("인트로 영상")
+-                    if rep.get("warnings"):
+-                        self.lbl_progress.setToolTip("\n".join(rep["warnings"][:6]))
++                    warnings = rep.get("warnings") or []
++                    if warnings:
++                        self.lbl_progress.setToolTip("\n".join(warnings[:6]))
+                 except Exception:
+                     pass
+-            self.lbl_progress.setText("✅ 완성!" + (" (" + " · ".join(extra) + ")" if extra else ""))
++            self.lbl_progress.setText(("⚠️ 완료 (일부 단계 생략 — 상세 내용 확인)" if warnings else "✅ 완성!")
++                                      + (" (" + " · ".join(extra) + ")" if extra else ""))
+             if target:
+                 self.player.setSource(QUrl.fromLocalFile(str(target)))
+         else:
+diff --git a/svc.py b/svc.py
+index de4c84f..0b4568f 100644
+--- a/svc.py
++++ b/svc.py
+@@ -9,7 +9,7 @@ svc.py - 생성된 노래의 '보컬 음색'을 내 목소리 쪽으로 옮기
+           실제 신경망 변환을 수행한다. 이 경로만이 '진짜 음색 복제'에 해당한다.
+           필요: audio_engines/RVC (RVC-WebUI), assets/weights/<name>.pth
+ 2) dsp  : 설치 없이도 항상 동작하는 근사 변환.
+-          - 내 목소리 프로필의 f0 대역으로 곡 전체를 ±2반음 이내에서 이동(멜로디 유지)
++          - 기본: 원곡 가창 음정 보존. 낭독 f0로 강제 이동하지 않음
+           - 내 발화의 평균 스펙트럼 포락선과 곡 보컬의 차이를 EQ 로 보정 (음색 결)
+           - HNR(숨소리) 차이를 고역 공기감/디에서로 완만하게 보정
+           ※ dsp 는 '음색 근사'이며 화자 복제가 아니다. 이 점을 결과 리포트에 명시한다.
+@@ -57,14 +57,16 @@ def decode(path, sr: int = SR, ch: int = 2):
+     return np.ascontiguousarray(y.reshape(-1, ch))
+ 
+ 
+-def write_wav(y, path, sr: int = SR):
++def write_wav(y, path, sr: int = SR, codec="pcm_s24le"):
+     y = np.ascontiguousarray(np.asarray(y, dtype=np.float32))
+     if y.ndim == 1:
+         y = y[:, None]
++    if not np.isfinite(y).all():
++        raise ValueError("오디오에 NaN/Inf가 포함되어 저장을 중단했습니다.")
+     Path(path).parent.mkdir(parents=True, exist_ok=True)
+     raw = subprocess.run(
+-        [_ffmpeg(), "-v", "error", "-f", "f32le", "-ar", str(sr), "-ac", str(y.shape[1]),
+-         "-i", "-", "-c:a", "pcm_s24le", "-f", "wav", str(path)],
++        [_ffmpeg(), "-y", "-v", "error", "-f", "f32le", "-ar", str(sr), "-ac", str(y.shape[1]),
++         "-i", "-", "-c:a", codec, "-f", "wav", str(path)],
+         input=y.tobytes(), capture_output=True)
+     if raw.returncode != 0:
+         raise RuntimeError("WAV 저장 실패: " + raw.stderr.decode("utf-8", "replace")[-300:])
+@@ -87,10 +89,11 @@ def find_rvc_model(name: str):
+     root = rvc_root()
+     if not root:
+         return None, None
+-    weights = list((root / "assets" / "weights").rglob(f"{name}*.pth")) if \
++    weights = list((root / "assets" / "weights").rglob("*.pth")) if \
+         (root / "assets" / "weights").exists() else []
+     index = list((root / "logs").rglob(f"{name}*/*.index")) if (root / "logs").exists() else []
+-    return (weights[0] if weights else None), (index[0] if index else None)
++    exact = [p for p in weights if p.stem == name]
++    return (exact[0] if len(exact) == 1 else None), (index[0] if len(index) == 1 else None)
+ 
+ 
+ def rvc_available(name: str) -> bool:
+@@ -145,7 +148,7 @@ def _spectral_envelope(y, sr: int, n_fft: int = 4096, bands: int = 48):
+     for i in range(bands):
+         m = (freqs >= edges[i]) & (freqs < edges[i + 1])
+         out[i] = avg[m].mean() if m.any() else avg[np.argmin(np.abs(freqs - edges[i]))]
+-    return 20 * np.log10(out + 1e-12), (edges[:-1] + edges[1:]) / 2
++    return 10 * np.log10(out + 1e-12), (edges[:-1] + edges[1:]) / 2
+ 
+ 
+ def _f0_median(y, sr: int) -> float:
+@@ -168,31 +171,12 @@ def _f0_median(y, sr: int) -> float:
+ 
+ 
+ def _apply_eq_curve(y, sr: int, freqs, gains_db):
+-    """밴드별 게인을 주파수 응답으로 만들어 STFT 에 적용."""
++    from audio_dsp_safe import spectral_gain
+     n_fft, hop = 4096, 1024
+-    out = y.astype(np.float32).copy()
+     ff = np.fft.rfftfreq(n_fft, 1.0 / sr)
+     curve = np.interp(ff, freqs, gains_db, left=gains_db[0], right=gains_db[-1])
+-    gain = 10 ** (curve / 20.0)
+-    win = np.hanning(n_fft).astype(np.float32)
+-    for ch in range(y.shape[1]):
+-        x = out[:, ch]
+-        if len(x) < n_fft * 2:
+-            continue
+-        spec = np.fft.rfft(np.lib.stride_tricks.sliding_window_view(x, n_fft)[::hop] * win, axis=1)
+-        spec *= gain[None, :]
+-        frames = np.fft.irfft(spec, n=n_fft, axis=1).astype(np.float32)
+-        acc = np.zeros(len(x) + n_fft, dtype=np.float32)
+-        nrm = np.zeros(len(x) + n_fft, dtype=np.float32)
+-        for i, f in enumerate(frames):
+-            a = i * hop
+-            acc[a:a + n_fft] += f * win
+-            nrm[a:a + n_fft] += win ** 2
+-        out[:, ch] = (acc / np.maximum(nrm, 1e-6))[: len(x)]
+-    peak = float(np.max(np.abs(out))) if out.size else 0.0
+-    if peak > 0.999:
+-        out *= 0.999 / peak
+-    return out
++    return spectral_gain(y, 10 ** (curve / 20.0), n_fft, hop)
++
+ 
+ 
+ def _pitch_shift(y, sr: int, semitones: float):
+@@ -234,12 +218,12 @@ def _pitch_shift(y, sr: int, semitones: float):
+ 
+ def convert_dsp(vocal_path, profile: dict, out_wav) -> dict:
+     y = decode(vocal_path, SR, 2)
+-    notes = []
+-    # 1) 음역 정렬 (멜로디 유지 위해 ±2반음 제한)
++    notes = [] if profile.get("allow_singing_transpose", False) else ["낭독 음역으로 강제 하향하지 않음: 원곡 멜로디/음정 유지"]
++    # 1) 원곡 음정 보존. 명시적으로 허용한 프로필만 전체 ±2반음 이동
+     target = float(profile.get("f0_median_hz") or 0)
+     cur = _f0_median(y, SR)
+     semis = 0.0
+-    if target > 0 and cur > 0:
++    if profile.get("allow_singing_transpose", False) and target > 0 and cur > 0:
+         semis = 12 * math.log2(target / cur)
+         semis = max(-2.0, min(2.0, semis))
+         if abs(semis) < 0.25:
+@@ -256,11 +240,11 @@ def convert_dsp(vocal_path, profile: dict, out_wav) -> dict:
+         env_s, freqs = _spectral_envelope(speech, SR)
+         env_v, _ = _spectral_envelope(y, SR)
+         diff = env_s - env_v
+-        # 저역/고역 과보정 방지: ±6dB 클램프 + 스무딩
+-        diff = np.clip(diff, -6.0, 6.0)
++        # 발화 음색으로 가창을 과보정하지 않도록 ±3dB 클램프 + 약한 적용
++        diff = np.clip(diff, -3.0, 3.0)
+         k = np.ones(5) / 5.0
+         diff = np.convolve(diff, k, mode="same")
+-        env_gain = 0.7  # 100% 적용하면 부자연스러움
++        env_gain = 0.35  # 100% 적용하면 부자연스러움
+         y = _apply_eq_curve(y, SR, freqs, diff * env_gain)
+         notes.append(f"내 목소리 평균 음색에 맞춰 밴드 EQ 보정(최대 ±{np.max(np.abs(diff) * env_gain):.1f}dB)")
+     # 3) 숨소리(HNR) 방향 보정
+@@ -287,9 +271,7 @@ def convert_vocal(vocal_path, profile_path, out_wav, backend: str = "auto") -> d
+         except Exception as e:  # noqa: BLE001
+             if backend == "rvc":
+                 raise
+-            res = convert_dsp(vocal_path, profile, out_wav)
+-            res["rvc_error"] = str(e)[:300]
+-            return res
++            raise RuntimeError("학습된 RVC 변환 실패: 다른 음색으로 대체하지 않고 원본을 유지합니다.") from e
+     if backend == "rvc":
+         raise RuntimeError("RVC 모델을 찾지 못했습니다 (audio_engines/RVC, assets/weights).")
+     return convert_dsp(vocal_path, profile, out_wav)
+diff --git a/test_upgrade.py b/test_upgrade.py
+new file mode 100644
+index 0000000..49aef40
+--- /dev/null
++++ b/test_upgrade.py
+@@ -0,0 +1,351 @@
++"""Offline regression suite. No real API calls, model downloads or music generation.
++Run: QT_QPA_PLATFORM=offscreen python -m unittest -v test_upgrade
++"""
++import io
++import json
++import os
++os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
++import tempfile
++import unittest
++import urllib.error
++from pathlib import Path
++from unittest.mock import patch
++import numpy as np
++
++import gemini_lyrics
++import lyrics_writer
++import workspace_state
++import training_genres
++import vocal_pipeline
++import svc
++import vocal_post
++import vocal_coach
++from audio_dsp_safe import spectral_gain, smooth_edge
++
++
++class GeminiTests(unittest.TestCase):
++    def response(self, text="[Verse 1]\n창가에 앉아", reason="STOP"):
++        return io.BytesIO(json.dumps({"candidates": [{"finishReason": reason, "content": {
++            "parts": [{"text": "private thought", "thought": True}, {"text": text}]}}]}).encode())
++
++    def test_key_header_and_payload(self):
++        with patch("urllib.request.urlopen", return_value=self.response()) as req:
++            self.assertIn("창가", gemini_lyrics.generate("주제", "작사가", api_key="secret-key"))
++        request = req.call_args.args[0]
++        self.assertNotIn("secret-key", request.full_url)
++        self.assertEqual(request.get_header("X-goog-api-key"), "secret-key")
++        payload = json.loads(request.data)
++        self.assertEqual(payload["systemInstruction"]["parts"][0]["text"], "작사가")
++
++    def test_missing_key(self):
++        with patch.dict(os.environ, {}, clear=True), self.assertRaisesRegex(RuntimeError, "API 키"):
++            gemini_lyrics.generate("p", "s")
++
++    def test_environment_key(self):
++        with patch.dict(os.environ, {"GEMINI_API_KEY": "env-key"}), patch("urllib.request.urlopen", return_value=self.response()) as req:
++            gemini_lyrics.generate("p", "s")
++            self.assertEqual(req.call_args.args[0].get_header("X-goog-api-key"), "env-key")
++
++    def test_error_redacts_key(self):
++        err = urllib.error.HTTPError("secret-key-in-url", 403, "secret-key", {}, None)
++        with patch("urllib.request.urlopen", side_effect=err), self.assertRaises(RuntimeError) as raised:
++            gemini_lyrics.generate("p", "s", api_key="secret-key")
++        self.assertNotIn("secret-key", str(raised.exception))
++
++    def test_retry_transient(self):
++        err = urllib.error.HTTPError("url", 429, "limited", {}, None)
++        with patch("urllib.request.urlopen", side_effect=[err, self.response()]) as req, patch("time.sleep"):
++            gemini_lyrics.generate("p", "s", api_key="key")
++            self.assertEqual(req.call_count, 2)
++
++    def test_empty_or_truncated_rejected(self):
++        for text, reason in [("", "STOP"), ("partial", "MAX_TOKENS"), ("blocked", "SAFETY")]:
++            with self.subTest(reason=reason), patch("urllib.request.urlopen", return_value=self.response(text, reason)), self.assertRaises(RuntimeError):
++                gemini_lyrics.generate("p", "s", api_key="key")
++
++    def test_model_path_validation(self):
++        with self.assertRaises(ValueError):
++            gemini_lyrics.generate("p", "s", api_key="key", model="bad/model?key=x")
++
++    def test_gemini_provider_never_calls_local(self):
++        raw = "[Verse 1]\n창가에 남은 온기\n조용히 놓인 찻잔\n그날의 작은 약속\n이제는 웃어 본다\n[Chorus]\n너를 보내는 저녁\n노을이 물든 거리\n내일을 향해 걷자\n다시 내 이름 불러"
++        with patch.object(lyrics_writer, "gemini_generate", return_value=raw) as remote, patch.object(lyrics_writer, "ollama_generate") as local:
++            result = lyrics_writer.generate_lyrics("이별 뒤의 일상", "trot", duration=60, candidates=1, log=lambda *_: None)
++            self.assertIn("[Chorus]", result)
++            self.assertGreaterEqual(remote.call_count, 2)
++            local.assert_not_called()
++
++    def test_api_failure_no_local_fallback(self):
++        with patch.object(lyrics_writer, "gemini_generate", side_effect=RuntimeError("failed")), patch.object(lyrics_writer, "ollama_generate") as local, self.assertRaises(RuntimeError):
++            lyrics_writer.generate_lyrics("주제", candidates=1)
++        local.assert_not_called()
++
++
++class DraftAndGenreTests(unittest.TestCase):
++    def test_atomic_roundtrip_and_empty_tombstone(self):
++        with tempfile.TemporaryDirectory() as d:
++            p = Path(d) / "draft.json"
++            state = {"topic": "새 주제", "body": "고친 본문", "pages": 120, "genre": "essay"}
++            workspace_state.save_draft(p, state)
++            self.assertEqual(workspace_state.load_draft(p)["body"], "고친 본문")
++            workspace_state.save_draft(p, {"topic": "", "body": ""})
++            self.assertEqual(workspace_state.load_draft(p)["body"], "")
++            self.assertFalse(list(Path(d).glob("*.tmp")))
++
++    def test_corrupt_draft_is_safe(self):
++        with tempfile.TemporaryDirectory() as d:
++            p = Path(d) / "draft.json"
++            for raw in ("{bad", "[]", "null", '{"version":99}'):
++                p.write_text(raw)
++                self.assertEqual(workspace_state.load_draft(p), {})
++
++    def test_all_genres_and_unknown_caption(self):
++        self.assertEqual(training_genres.detect_genre("내노래_트로트.wav"), "trot")
++        self.assertEqual(training_genres.detect_genre("quiet_jazz.wav"), "jazz")
++        self.assertEqual(training_genres.detect_genre("unlabelled-123.wav"), "unknown")
++        self.assertNotIn("pop", training_genres.caption_for("unknown").lower())
++        import vocal_trainer_runner
++        for key in training_genres.GENRES:
++            self.assertTrue(vocal_trainer_runner.build_caption(key, 100, False))
++        self.assertIn("trot", vocal_trainer_runner.build_caption("trot", 100, False))
++
++    def test_trot_available_in_song_menu(self):
++        self.assertIn("trot", [key for _, keys in lyrics_writer.GENRE_MENU for key in keys])
++        self.assertIn("trot", lyrics_writer.build_caption("trot", "female"))
++
++
++class AudioSafetyTests(unittest.TestCase):
++    def setUp(self):
++        self.temp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.temp.cleanup)
++        self.d = Path(self.temp.name)
++
++    def tone(self, n=96000, freq=330.0):
++        t = np.arange(n) / 48000
++        y = (.15 * np.sin(2 * np.pi * freq * t)).astype(np.float32)
++        return np.column_stack([y, y])
++
++    def test_unity_eq_preserves_both_edges_and_short_clips(self):
++        for n in (1, 127, 4096, 48000, 48137):
++            y = np.random.default_rng(7).normal(0, .1, (n, 2)).astype(np.float32)
++            actual = spectral_gain(y, np.ones(2049))
++            np.testing.assert_allclose(actual, y, atol=1e-6)
++
++    def test_eq_implementations_preserve_tail(self):
++        y = self.tone(48137)
++        np.testing.assert_allclose(svc._apply_eq_curve(y, 48000, [80, 24000], [0, 0]), y, atol=1e-6)
++        np.testing.assert_allclose(vocal_coach._apply_eq(y, 48000, np.zeros(2049)), y, atol=1e-6)
++
++    def test_edge_smoothing_no_boundary_dip(self):
++        for n in (1, 20, 500):
++            np.testing.assert_allclose(smooth_edge(np.ones(n), 64), np.ones(n))
++
++    def test_legato_no_nan_at_exact_hop_duration(self):
++        for n in (48000, 48137, 120):
++            y = self.tone(n)
++            out = vocal_post.legato(y, 48000, .4)
++            self.assertEqual(out.shape, y.shape)
++            self.assertTrue(np.isfinite(out).all())
++            self.assertGreater(float(np.sqrt(np.mean(out[-min(n, 1000):] ** 2))), .03)
++
++    def test_speech_profile_cannot_lower_singing_pitch(self):
++        y = self.tone()
++        with patch.object(svc, "decode", return_value=y), patch.object(svc, "_f0_median", return_value=330), patch.object(svc, "_pitch_shift") as shifter, patch.object(svc, "write_wav"):
++            report = svc.convert_dsp("v.wav", {"f0_median_hz": 100, "hnr_db": 12}, "o.wav")
++        shifter.assert_not_called()
++        self.assertEqual(report["pitch_shift_semitones"], 0)
++
++    def test_no_stems_never_treats_full_mix_as_voice(self):
++        with patch("importlib.util.find_spec", return_value=None):
++            self.assertEqual(vocal_pipeline.prepare_stems("mix.mp3", self.d), (None, None))
++
++    def test_requires_both_explicit_stems(self):
++        with self.assertRaises(ValueError):
++            vocal_pipeline.prepare_stems("mix.mp3", self.d, vocal="v.wav")
++
++    def test_remix_unchanged_stems_reconstruct_original(self):
++        v, b = self.tone(48137, 330), self.tone(48137, 110) * .5
++        for name, y in [("v.wav", v), ("b.wav", b)]:
++            svc.write_wav(y, self.d / name)
++        result = vocal_pipeline.remix(self.d / "v.wav", self.d / "v.wav", self.d / "b.wav", self.d / "mix.wav")
++        out = svc.decode(self.d / "mix.wav")
++        np.testing.assert_allclose(out, v+b, atol=1e-6)
++        self.assertTrue(result["backing_preserved"])
++
++    def test_remix_bad_duration_is_rejected(self):
++        svc.write_wav(self.tone(), self.d / "ref.wav")
++        svc.write_wav(self.tone(48000), self.d / "bad.wav")
++        with self.assertRaisesRegex(RuntimeError, "길이"):
++            vocal_pipeline.remix(self.d / "bad.wav", self.d / "ref.wav", self.d / "ref.wav", self.d / "out.wav")
++
++    def test_dropout_screen_and_scope(self):
++        y = self.tone(240000)
++        svc.write_wav(y, self.d / "steady.wav")
++        self.assertEqual(vocal_pipeline.continuity_metrics(self.d / "steady.wav")["penalty"], 0)
++        y[96000:100800] = 0
++        svc.write_wav(y, self.d / "dip.wav")
++        report = vocal_pipeline.continuity_metrics(self.d / "dip.wav")
++        self.assertGreater(report["dropout_count"], 0)
++        self.assertEqual(report["scope"], "mix_energy_only")
++
++    def test_rvc_failure_does_not_switch_to_dsp(self):
++        with patch.object(svc, "load_profile", return_value={"name": "me"}), patch.object(svc, "rvc_available", return_value=True), patch.object(svc, "convert_rvc", side_effect=RuntimeError("bad")), patch.object(svc, "convert_dsp") as dsp, self.assertRaisesRegex(RuntimeError, "대체하지"):
++            svc.convert_vocal("in.wav", "profile.json", "out.wav")
++        dsp.assert_not_called()
++
++    def test_coach_preserves_melody_by_default(self):
++        source, out = self.d / "v.wav", self.d / "out.wav"
++        svc.write_wav(self.tone(96000), source)
++        with patch.object(vocal_coach, "pitch_style", side_effect=AssertionError("must not shift")):
++            report = vocal_coach.polish_star(source, out, intensity=.5)
++        self.assertFalse(report["stages"][0]["applied"])
++        self.assertTrue(np.isfinite(svc.decode(out)).all())
++
++    def test_finalizer_without_stems_preserves_mp3_audio_bytes(self):
++        import subprocess
++        source, out = self.d / "source.mp3", self.d / "out.mp3"
++        wav = self.d / "test.wav"
++        svc.write_wav(self.tone(), wav)
++        subprocess.run([svc._ffmpeg(), "-y", "-v", "error", "-i", str(wav), str(source)], check=True)
++        import song_finalize
++        args = ["song_finalize", "--input", str(source), "--output", str(out), "--cover", "none", "--no-lyrics-tag"]
++        with patch("sys.argv", args), patch.object(vocal_pipeline, "prepare_stems", return_value=(None, None)), patch.object(vocal_coach, "polish_star") as coach, patch.object(vocal_post, "polish_song") as polish:
++            self.assertEqual(song_finalize.main(), 0)
++        coach.assert_not_called()
++        polish.assert_not_called()
++        self.assertEqual(source.read_bytes(), out.read_bytes())
++
++
++class GuiTests(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        from PyQt6.QtWidgets import QApplication
++        cls.app = QApplication.instance() or QApplication([])
++
++    def setUp(self):
++        import widget_app
++        from PyQt6.QtWidgets import QWidget
++        self.temp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.temp.cleanup)
++        self.root = Path(self.temp.name)
++        self.patcher = patch.object(widget_app, "BATCH_OUT", self.root)
++        self.patcher.start()
++        self.addCleanup(self.patcher.stop)
++        self.widget_app = widget_app
++        self.studio = widget_app.YunseulLMMStudio.__new__(widget_app.YunseulLMMStudio)
++        QWidget.__init__(self.studio)
++        self.studio.ebook_worker = None
++        self.tab = self.studio.create_ebook_tab()
++        self.merge = self.studio.create_merge_tab()
++        self.addCleanup(self.studio.deleteLater)
++        self.addCleanup(self.tab.deleteLater)
++        self.addCleanup(self.merge.deleteLater)
++
++    def test_initial_editors_blank_not_sample_files(self):
++        self.assertEqual(self.studio.edit_topic.text(), "")
++        self.assertEqual(self.studio.txt_ebook.toPlainText(), "")
++        self.assertEqual(self.studio.list_sources.count(), 0)
++        self.assertEqual(self.studio.edit_merge_prompt.text(), "")
++        self.assertEqual(self.studio.txt_merge_res.toPlainText(), "")
++
++    def test_restore_latest_manual_edits_and_settings(self):
++        s = self.studio
++        s.edit_topic.setText("내 원고")
++        s.txt_ebook.setPlainText("직전에 직접 고친 본문")
++        s.edit_ebook_persona.setText("담백한 1인칭")
++        s.spin_ebook_pages.setValue(120)
++        s._save_ebook_workspace()
++        s.txt_ebook.clear()
++        s.edit_topic.clear()
++        s._restore_ebook_workspace()
++        self.assertEqual(s.txt_ebook.toPlainText(), "직전에 직접 고친 본문")
++        self.assertEqual(s.edit_topic.text(), "내 원고")
++        self.assertEqual(s.spin_ebook_pages.value(), 120)
++        self.assertEqual(s.edit_ebook_persona.text(), "담백한 1인칭")
++
++    def test_new_draft_backs_up_then_stays_empty_on_restore(self):
++        from PyQt6.QtWidgets import QMessageBox
++        s = self.studio
++        s.txt_ebook.setPlainText("소중한 이전 원고")
++        s.edit_topic.setText("이전 주제")
++        with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes):
++            s.new_ebook_workspace()
++        self.assertEqual(s.txt_ebook.toPlainText(), "")
++        self.assertEqual(s.edit_topic.text(), "")
++        backups = list(self.root.glob("ebook-backup-*.json"))
++        self.assertEqual(len(backups), 1)
++        self.assertEqual(workspace_state.load_draft(backups[0])["body"], "소중한 이전 원고")
++        s._restore_ebook_workspace()
++        self.assertEqual(s.txt_ebook.toPlainText(), "")
++
++    def test_new_draft_save_failure_does_not_clear(self):
++        from PyQt6.QtWidgets import QMessageBox
++        s = self.studio
++        s.txt_ebook.setPlainText("보호할 원고")
++        with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes), patch.object(QMessageBox, "warning"), patch.object(s, "_save_ebook_workspace", return_value=False):
++            s.new_ebook_workspace()
++        self.assertEqual(s.txt_ebook.toPlainText(), "보호할 원고")
++
++    def test_merge_paths_keep_external_files_and_clear(self):
++        from PyQt6.QtWidgets import QFileDialog
++        from PyQt6.QtCore import Qt
++        source = self.root / "outside.txt"
++        source.write_text("이번 작업의 원문")
++        with patch.object(QFileDialog, "getOpenFileName", return_value=(str(source), "")):
++            self.studio.add_source_file()
++        self.assertEqual(self.studio.list_sources.item(0).data(Qt.ItemDataRole.UserRole), str(source.resolve()))
++        self.studio.txt_merge_res.setPlainText("결과")
++        self.studio.clear_merge_workspace()
++        self.assertEqual(self.studio.list_sources.count(), 0)
++        self.assertEqual(self.studio.txt_merge_res.toPlainText(), "")
++        self.assertTrue(source.exists())
++
++    def test_merge_uses_actual_source_not_shipped_folder(self):
++        from PyQt6.QtWidgets import QFileDialog
++        from unittest.mock import MagicMock
++        s = self.studio
++        source = self.root / "outside.txt"
++        source.write_text("외부 원문으로만 작성")
++        with patch.object(QFileDialog, "getOpenFileName", return_value=(str(source), "")):
++            s.add_source_file()
++        s.edit_merge_prompt.setText("정리")
++        s.port, s.cfg = 11434, {}
++        with patch.object(s, "is_server_alive", return_value=True), patch.object(s, "check_vram_for_task", return_value=(True, "")), patch.object(self.widget_app, "TextGenWorker") as worker:
++            s.start_merge_generation()
++            self.assertIn("외부 원문으로만 작성", worker.call_args.args[2])
++
++    def test_song_studio_gemini_controls_and_warning_report(self):
++        from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
++        from PyQt6.QtWidgets import QLineEdit
++        from song_studio import SongStudio
++        host = self.studio
++        host.player, host.audio_output = QMediaPlayer(), QAudioOutput()
++        host.cfg, host.port = {}, 11434
++        song = SongStudio(host, self.root, self.root / "songs", self.root / "models", self.root / "python")
++        self.addCleanup(song.deleteLater)
++        self.assertEqual(song.combo_lyrics_provider.currentData(), "gemini")
++        self.assertEqual(song.edit_gemini_key.echoMode(), QLineEdit.EchoMode.Password)
++        self.assertIn("trot", [b.property("genre") for b in song.genre_group.buttons()])
++        target = self.root / "songs" / "song-test.mp3"
++        target.write_bytes(b"not an audio fixture")
++        target.with_suffix(".finalize.json").write_text(json.dumps({"warnings": ["Demucs 없음: 보컬 처리 생략"]}))
++        song.edit_lyrics.setPlainText("[Verse]\n연습 가사")
++        with patch.object(song, "refresh_library"):
++            song._on_finalize_done(True, str(target), "")
++        self.assertIn("일부 단계 생략", song.lbl_progress.text())
++        self.assertIn("Demucs", song.lbl_progress.toolTip())
++
++    def test_new_draft_during_generation_is_blocked(self):
++        from PyQt6.QtWidgets import QMessageBox
++        from unittest.mock import MagicMock
++        s = self.studio
++        s.txt_ebook.setPlainText("진행 중 원고")
++        s.ebook_worker = MagicMock()
++        s.ebook_worker.isRunning.return_value = True
++        with patch.object(QMessageBox, "information"):
++            s.new_ebook_workspace()
++        self.assertEqual(s.txt_ebook.toPlainText(), "진행 중 원고")
++
++
++if __name__ == "__main__":
++    unittest.main(verbosity=2)
+diff --git a/training_genres.py b/training_genres.py
+new file mode 100644
+index 0000000..750fcfd
+--- /dev/null
++++ b/training_genres.py
+@@ -0,0 +1,44 @@
++"""Explicit genre labels; unknown audio must not be relabelled as K-pop."""
++GENRES = {
++    "all": ("전체 장르 (원래 장르 유지)", ""),
++    "trot": ("트로트", "Korean trot, expressive lead vocal, rhythmic phrasing, controlled vibrato"),
++    "ballad": ("발라드", "Korean ballad, expressive lead vocal, clear diction"),
++    "kpop": ("K-pop", "Korean pop, clear lead vocal, polished arrangement"),
++    "rock": ("록", "rock, live band arrangement, expressive lead vocal"),
++    "rnb": ("R&B / 소울", "R&B soul, smooth lead vocal, groove"),
++    "hiphop": ("힙합 / 랩", "hip hop, rhythmic rap vocal, clear diction"),
++    "jazz": ("재즈", "jazz, expressive phrasing, lead vocal"),
++    "folk": ("포크 / 어쿠스틱", "folk acoustic, natural lead vocal"),
++    "electronic": ("일렉트로닉 / 댄스", "electronic dance music, rhythmic lead vocal"),
++    "classical": ("클래식 / 성악", "classical vocal, sustained phrasing"),
++    "gospel": ("CCM / 가스펠", "gospel, expressive lead vocal"),
++}
++KEYWORDS = {
++    "trot": ("trot", "트로트", "뽕짝"), "ballad": ("ballad", "발라드"),
++    "kpop": ("kpop", "k-pop", "아이돌"), "rock": ("rock", "록", "락", "metal", "메탈"),
++    "rnb": ("rnb", "r&b", "soul", "소울"), "hiphop": ("hiphop", "hip-hop", "힙합", "rap"),
++    "jazz": ("jazz", "재즈"), "folk": ("folk", "포크", "acoustic", "어쿠스틱"),
++    "electronic": ("edm", "techno", "dance", "댄스", "일렉트로닉"),
++    "classical": ("classic", "opera", "클래식", "성악", "오페라"),
++    "gospel": ("gospel", "ccm", "가스펠", "찬송가"),
++}
++
++
++def detect_genre(path):
++    from pathlib import Path
++    text = Path(path).stem.lower()
++    try:
++        import mutagen
++        audio = mutagen.File(str(path))
++        if audio and audio.tags:
++            text += " " + " ".join(str(v) for v in audio.tags.values()).lower()
++    except Exception:
++        pass
++    for key, words in KEYWORDS.items():
++        if any(word in text for word in words):
++            return key
++    return "unknown"
++
++
++def caption_for(category):
++    return GENRES.get(category, ("", ""))[1] or "music, original arrangement, clear lead vocal"
+diff --git a/vocal_coach.py b/vocal_coach.py
+index d1280fb..327061a 100644
+--- a/vocal_coach.py
++++ b/vocal_coach.py
+@@ -253,7 +253,8 @@ def phrase_dynamics(y, sr=SR, amount=0.85) -> tuple:
+                 gains[i:i + atk] *= np.linspace(0.90, 1.0, atk) ** amount
+         i = j + 1
+     gi = np.interp(np.arange(len(mono)), np.arange(n) * hop + hop / 2, gains)
+-    gi = np.convolve(gi, np.ones(48, dtype=np.float32) / 48, mode="same")
++    from audio_dsp_safe import smooth_edge
++    gi = smooth_edge(gi, 48)
+     out = y.astype(np.float32).copy()
+     for ch in range(out.shape[1]):
+         out[:, ch] *= gi.astype(np.float32)
+@@ -289,32 +290,14 @@ def air(y, sr=SR, db=1.2) -> np.ndarray:
+ 
+ 
+ def _apply_eq(y, sr, curve_db, n_fft=4096, hop=1024):
+-    out = y.astype(np.float32).copy()
+-    gain = 10 ** (curve_db / 20.0)
+-    win = np.hanning(n_fft).astype(np.float32)
+-    for ch in range(y.shape[1]):
+-        x = out[:, ch]
+-        if len(x) < n_fft * 2:
+-            continue
+-        frames = np.lib.stride_tricks.sliding_window_view(x, n_fft)[::hop]
+-        spec = np.fft.rfft(frames * win, axis=1) * gain[None, :]
+-        rec = np.fft.irfft(spec, n=n_fft, axis=1).astype(np.float32)
+-        acc = np.zeros(len(x) + n_fft, dtype=np.float32)
+-        nrm = np.zeros(len(x) + n_fft, dtype=np.float32)
+-        for i, f in enumerate(rec):
+-            a = i * hop
+-            acc[a:a + n_fft] += f * win
+-            nrm[a:a + n_fft] += win ** 2
+-        out[:, ch] = (acc / np.maximum(nrm, 1e-6))[: len(x)]
+-    peak = float(np.max(np.abs(out))) if out.size else 0.0
+-    if peak > 0.999:
+-        out *= 0.999 / peak
+-    return out
++    from audio_dsp_safe import spectral_gain
++    return spectral_gain(y, 10 ** (curve_db / 20.0), n_fft, hop)
++
+ 
+ 
+ # ---------------------------------------------------------------- 통합
+ def polish_star(input_path, output_path, preset="ballad", intensity=1.0,
+-                report_path=None) -> dict:
++                report_path=None, preserve_melody=True) -> dict:
+     """가수처럼 들리게 만드는 전체 체인. 실제 적용 내역과 전/후 지표를 남긴다."""
+     cfg = dict(PRESETS.get(preset, PRESETS["ballad"]))
+     k = max(0.0, min(1.5, float(intensity)))
+@@ -324,8 +307,11 @@ def polish_star(input_path, output_path, preset="ballad", intensity=1.0,
+     before = vocal_health(y)
+     stages = []
+ 
+-    y, st = pitch_style(y, SR, drift=cfg["drift"] * k, rate=cfg["rate"],
+-                        depth_cents=cfg["depth"] * k, delay=cfg["delay"])
++    if preserve_melody:
++        st = {"applied": False, "reason": "원곡 음정/비브라토 보존 (재합성 피치 변조 안 함)"}
++    else:
++        y, st = pitch_style(y, SR, drift=cfg["drift"] * k, rate=cfg["rate"],
++                            depth_cents=cfg["depth"] * k, delay=cfg["delay"])
+     stages.append({"stage": "pitch_style", **st})
+ 
+     y, st = phrase_dynamics(y, SR, cfg["dyn"] * k)
+diff --git a/vocal_pipeline.py b/vocal_pipeline.py
+new file mode 100644
+index 0000000..5b4a9c8
+--- /dev/null
++++ b/vocal_pipeline.py
+@@ -0,0 +1,112 @@
++"""Protect accompaniment: vocal operations require a separated or explicit vocal stem."""
++import importlib.util
++import os
++import json
++import subprocess
++import sys
++from pathlib import Path
++import numpy as np
++
++
++def demucs_python():
++    configured = os.environ.get("YUNSEUL_AUDIO_PYTHON", "").strip()
++    if configured:
++        if not Path(configured).is_file():
++            raise RuntimeError("YUNSEUL_AUDIO_PYTHON 경로를 찾을 수 없습니다.")
++        candidates = [configured]
++    else:
++        base = Path(__file__).resolve().parent
++        candidates = [] if getattr(sys, "frozen", False) else [sys.executable]
++        candidates.extend(str(base / "audio_engines" / "venv_acestep" / suffix)
++                          for suffix in ("Scripts/python.exe", "bin/python"))
++    for exe in dict.fromkeys(candidates):
++        if not Path(exe).is_file():
++            continue
++        if exe == sys.executable and not getattr(sys, "frozen", False):
++            if importlib.util.find_spec("demucs") is not None:
++                return exe
++            continue
++        try:
++            check = subprocess.run([exe, "-c", "import demucs"], capture_output=True, timeout=15)
++            if check.returncode == 0:
++                return exe
++        except (OSError, subprocess.TimeoutExpired):
++            pass
++    return None
++
++
++def prepare_stems(source, workdir, vocal=None, accompaniment=None):
++    """Return (vocal, backing). Never treat a full mix as a solo vocal."""
++    workdir = Path(workdir)
++    workdir.mkdir(parents=True, exist_ok=True)
++    if bool(vocal) != bool(accompaniment):
++        raise ValueError("보컬과 반주 스템을 함께 지정하세요.")
++    if vocal:
++        if not Path(vocal).is_file() or not Path(accompaniment).is_file():
++            raise ValueError("지정된 스템 파일을 찾을 수 없습니다.")
++        return Path(vocal), Path(accompaniment)
++    exe = demucs_python()
++    if exe is None:
++        return None, None
++    proc = subprocess.run(
++        [exe, "-m", "demucs", "--two-stems", "vocals", "-n", "htdemucs",
++         "--out", str(workdir / "stems"), str(Path(source).resolve())],
++        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=600)
++    if proc.returncode:
++        raise RuntimeError("보컬 분리 실패: " + (proc.stderr or proc.stdout)[-300:])
++    stem = workdir / "stems" / "htdemucs" / Path(source).stem / "vocals.wav"
++    if not stem.is_file():
++        raise RuntimeError("분리된 보컬 파일이 없습니다.")
++    # Reconstruct residual from original instead of independently normalizing backing.
++    # This guarantees that an unchanged vocal stem sums back to the original mix.
++    import svc
++    original, voice = svc.decode(source), svc.decode(stem)
++    if abs(len(original) - len(voice)) > svc.SR // 20:
++        raise RuntimeError("분리 스템 길이가 원본과 다릅니다. 원본을 보호하기 위해 중단합니다.")
++    voice = np.pad(voice[:len(original)], ((0, max(0, len(original) - len(voice))), (0, 0)))
++    vocal_path, backing = workdir / "vocal.wav", workdir / "residual.wav"
++    svc.write_wav(voice, vocal_path, codec="pcm_f32le")
++    svc.write_wav(original - voice, backing, codec="pcm_f32le")
++    return vocal_path, backing
++
++
++def remix(processed, reference_vocal, backing, output):
++    import svc
++    v, ref, music = svc.decode(processed), svc.decode(reference_vocal), svc.decode(backing)
++    if abs(len(v) - len(ref)) > svc.SR // 20 or abs(len(music) - len(ref)) > svc.SR // 20:
++        raise RuntimeError("보컬 보정 중 길이가 바뀌었습니다. 리믹스를 중단합니다.")
++    n = len(music)
++    v = np.pad(v[:n], ((0, max(0, n - len(v))), (0, 0)))
++    rms_ref = float(np.sqrt(np.mean(ref.astype(np.float64) ** 2)))
++    rms_out = float(np.sqrt(np.mean(v.astype(np.float64) ** 2)))
++    if rms_out < 1e-8:
++        raise RuntimeError("보정된 보컬이 무음입니다.")
++    # Undo stem-only loudness normalization before restoring original backing balance.
++    gain = rms_ref / rms_out
++    y = music + v * gain
++    peak = float(np.max(np.abs(y))) if y.size else 0
++    attenuation = min(1.0, 0.98 / max(peak, 1e-9))
++    svc.write_wav(y * attenuation, output)
++    return {"vocal_gain": round(gain, 5), "peak_gain": round(attenuation, 5),
++            "samples": n, "backing_preserved": True}
++
++
++def continuity_metrics(path):
++    """Conservative mixed-audio dropout screen; NOT a singer identity detector."""
++    import svc
++    y = svc.decode(path, sr=16000, ch=1).reshape(-1)
++    hop = 1600
++    n = len(y) // hop
++    if n < 7:
++        return {"dropout_count": 0, "penalty": 0, "scope": "mix_energy_only"}
++    blocks = y[:n * hop].reshape(n, hop).astype(np.float64)
++    db = 20 * np.log10(np.sqrt(np.mean(blocks ** 2, axis=1)) + 1e-9)
++    events = []
++    for i in range(2, n - 2):
++        neighbors = min(float(np.median(db[i-2:i])), float(np.median(db[i+1:i+3])))
++        if neighbors > -40 and db[i] < neighbors - 18:
++            if not events or (i * 0.1 - events[-1]) > 0.3:
++                events.append(round(i * 0.1, 2))
++    return {"dropout_count": len(events), "times_sec": events[:50],
++            "penalty": min(20, len(events) * 3), "scope": "mix_energy_only",
++            "note": "의도된 쉼도 포함할 수 있음. 음정/화자 동일성은 별도 청음 필요"}
+diff --git a/vocal_post.py b/vocal_post.py
+index f875581..0ae49ab 100644
+--- a/vocal_post.py
++++ b/vocal_post.py
+@@ -67,6 +67,8 @@ def encode(y: np.ndarray, sr: int = SR) -> bytes:
+     if y.ndim == 1:
+         y = y[:, None]
+     y = np.ascontiguousarray(y.astype(np.float32))
++    if not np.isfinite(y).all():
++        raise ValueError("오디오에 NaN/Inf가 포함되어 저장을 중단했습니다.")
+     return subprocess.run(
+         [ffmpeg_bin(), "-v", "error", "-f", "f32le", "-ar", str(sr),
+          "-ac", str(y.shape[1]), "-i", "-", "-c:a", "pcm_s16le", "-f", "wav", "-"],
+@@ -129,12 +131,8 @@ def deharsh(y: np.ndarray, sr: int, amount: float, frame: int = 2048, hop: int =
+     bell = np.exp(-(lf ** 2) / (2 * 0.42 ** 2))
+     bell[freqs < 1500] = 0.0
+     gain = 1.0 - (amount * 0.55) * bell
+-    out = y.astype(np.float32).copy()
+-    for ch in range(y.shape[1]):
+-        spec = _stft(out[:, ch], frame, hop)
+-        spec *= gain[None, :]
+-        out[:, ch] = _istft(spec, frame, hop, n=len(out)).astype(np.float32)
+-    return out
++    from audio_dsp_safe import spectral_gain
++    return spectral_gain(y, gain, frame, hop)
+ 
+ 
+ # ---------------------------------------------------------------- 2) 레가토(엔벨로프 완만화)
+@@ -144,20 +142,23 @@ def legato(y: np.ndarray, sr: int, amount: float, win_ms: float = 46.0) -> np.nd
+         return y
+     hop = max(1, int(sr * 0.010))
+     mono = y.mean(axis=1).astype(np.float32)
+-    n = 1 + len(mono) // hop
++    if not len(mono):
++        return y.copy()
++    n = (len(mono) + hop - 1) // hop
+     env = np.empty(n, dtype=np.float32)
+     for i in range(n):
+         seg = mono[i * hop:(i + 1) * hop]
+         env[i] = float(np.sqrt(np.mean(seg.astype(np.float64) ** 2) + 1e-12))
+     w = max(1, int(win_ms / 10.0))
+     kernel = np.ones(w, dtype=np.float32) / w
+-    smooth = np.convolve(env, kernel, mode="same")
++    from audio_dsp_safe import smooth_edge
++    smooth = smooth_edge(env, w)
+     gain = np.clip((smooth + 1e-6) / (env + 1e-6), 0.30, 3.0)
+     gain = 1.0 + (gain - 1.0) * amount          # 보정 강도
+     # 프레임 게인을 샘플 단위로 보간
+     centers = np.arange(n) * hop + hop // 2
+     gi = np.interp(np.arange(len(mono)), centers, gain)
+-    gi = np.convolve(gi, np.ones(64, dtype=np.float32) / 64, mode="same")
++    gi = smooth_edge(gi, 64)
+     out = y.astype(np.float32).copy()
+     for ch in range(out.shape[1]):
+         out[:, ch] *= gi.astype(np.float32)
+diff --git a/vocal_trainer_runner.py b/vocal_trainer_runner.py
+index c5fb2d8..2a19e98 100644
+--- a/vocal_trainer_runner.py
++++ b/vocal_trainer_runner.py
+@@ -345,6 +345,13 @@ def analyze_music(path: Path, max_sec: float):
+ 
+ 
+ def build_caption(category: str, bpm, is_instrumental: bool):
++    from training_genres import GENRES, caption_for
++    if category in GENRES or category == "unknown":
++        base = caption_for(category)
++        if is_instrumental:
++            base = base.replace(", clear lead vocal", "").replace(", lead vocal", "").replace(", expressive lead vocal", "")
++            base += ", instrumental"
++        return base
+     if "발라드" in category and "K-pop" not in category:
+         base = "emotional Korean ballad, piano and strings, expressive lead vocal, clear diction"
+     elif "댄스" in category:
+@@ -444,7 +451,7 @@ def train_speech_voice(args) -> int:
+             log(f"  ⚠️ 변환 실패 {src.name}: {e}")
+             continue
+         caption = (f"{trigger}, dry studio close-mic a cappella {gender_en} vocal, "
+-                   "natural Korean singing voice, clear diction, no instruments, no reverb")
++                   "natural Korean spoken voice, speaker identity reference, clear diction, no instruments, no reverb")
+         samples.append({
+             "audio_path": str(dst), "filename": dst.name, "caption": caption,
+             "lyrics": f"[Verse]\n{text}", "bpm": 72, "keyscale": "",
+@@ -538,7 +545,7 @@ def main():
+     parser.add_argument("--file-list", default=None)
+     parser.add_argument("--audio-files", nargs="*", default=[])
+     parser.add_argument("--preset", default="standard", choices=["fast", "standard", "deep"])
+-    parser.add_argument("--genre-filter", default="kpop_ballad", choices=["kpop_ballad", "all"])
++    parser.add_argument("--genre-filter", default="all", choices=["kpop_ballad", "all", "trot", "ballad", "kpop", "rock", "rnb", "hiphop", "jazz", "folk", "electronic", "classical", "gospel"])
+     parser.add_argument("--output-dir", required=True)
+     parser.add_argument("--skip-train", action="store_true", help="데이터셋만 만들고 학습은 생략 (점검용)")
+     parser.add_argument("--mode", default="songs", choices=["songs", "speech"])
+@@ -614,7 +621,8 @@ def main():
+                 log(f"  ⏭️ PASS ({reason}): {af.name}")
+                 continue
+         else:
+-            category = "K-pop/발라드"
++            from training_genres import detect_genre
++            category = detect_genre(af) if args.genre_filter == "all" else args.genre_filter
+         todo.append((af, sig, category))
+         if idx % 10 == 0:
+             progress(1, 2 + int(idx / max(1, len(audio_files)) * 10), f"[1/5] 선별 중 ({idx + 1}/{len(audio_files)})")
+diff --git a/voice_enroll.py b/voice_enroll.py
+index 1ad3329..cfe6c3e 100644
+--- a/voice_enroll.py
++++ b/voice_enroll.py
+@@ -240,8 +240,12 @@ def build_profile(name: str, clips, out_dir: Path):
+     bright = "bright" if centroid > 2100 else "warm" if centroid > 1500 else "dark"
+     breath = "breathy" if hnr < 8 else "clear" if hnr > 16 else "natural"
+     hint = (f"{gender} {bright} {breath} mid-range lead vocal, natural Korean diction, "
+-            f"close-mic intimate tone")
++            f"close-mic tone, melodic sustained singing, connected vowels, stable singer identity, "
++            f"smooth register transitions, controlled breath support, preserve melody pitch")
+     profile = {
++        "source_type": "speech",
++        "allow_singing_transpose": False,
++        "singing_capability": "identity_reference_not_singing_range_measurement",
+         "name": name,
+         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+         "n_clips": len([p for p in per if not p.get("skipped")]),
+@@ -258,7 +262,8 @@ def build_profile(name: str, clips, out_dir: Path):
+         "breathiness": breath,
+         "caption_hint": hint,
+         "lora_scale_hint": 1.0 if total > 60 else 0.85,
+-        "sing_range_suggest_hz": [round(p10 * 0.9, 1), round(p90 * 1.35, 1)],
++        "sing_range_suggest_hz": None,  # 낭독 녹음만으로 실제 가창 음역을 측정할 수 없음
++        "speech_range_hz": [round(p10, 1), round(p90, 1)],
+         "clips": per,
+         "quality_notes": _quality_notes(len(ok), total, cents, formant, hnr),
+     }
+@@ -275,7 +280,7 @@ def _quality_notes(n, total, cents, formant, hnr):
+     elif n < 20:
+         notes.append(f"{n}문장으로 학습합니다. 30문장이면 억양이 더 자연스러워집니다.")
+     if total < 45:
+-        notes.append(f"총 발화 {total:.0f}초 — 60초 이상이면 노래 표현력이 좋아집니다.")
++        notes.append(f"총 발화 {total:.0f}초 — 충분한 녹음은 음색 학습에 유리하지만 가창 능력은 별도 노래 샘플로 확인하세요.")
+     if cents > 70:
+         notes.append(f"음높이 흔들림이 큽니다({cents:.0f} cent). 같은 문장을 2번 녹음해 보세요.")
+     if not formant:
+diff --git a/widget_app.py b/widget_app.py
+index 38c8c51..5dc0dba 100644
+--- a/widget_app.py
++++ b/widget_app.py
+@@ -483,7 +483,7 @@ class VocalTrainingWorker(QThread):
+     sig_log = pyqtSignal(str)
+     sig_finished = pyqtSignal(bool, str, str)
+ 
+-    def __init__(self, model_name, audio_files, preset="standard", genre_filter="kpop_ballad"):
++    def __init__(self, model_name, audio_files, preset="standard", genre_filter="all"):
+         super().__init__()
+         self.model_name = re.sub(r'[^\w\s-]', '', model_name).strip() or "CustomSinger"
+         self.audio_files = [str(Path(p).resolve()) for p in audio_files if Path(p).exists()]
+@@ -916,7 +916,8 @@ class YunseulLMMStudio(QWidget):
+         # 설정 바
+         top_bar = QHBoxLayout()
+         top_bar.addWidget(QLabel("주제:"))
+-        self.edit_topic = QLineEdit("인공지능의 현대 사회에 미치는 영향과 인간-AI 공존의 미래")
++        self.edit_topic = QLineEdit()
++        self.edit_topic.setPlaceholderText("새 전자책의 주제")
+         self.edit_topic.setStyleSheet("background-color: #1e293b; color: white; border: 1px solid #334155; border-radius: 6px; padding: 6px 10px;")
+         top_bar.addWidget(self.edit_topic)
+ 
+@@ -1039,10 +1040,6 @@ class YunseulLMMStudio(QWidget):
+                 border-radius: 8px; padding: 12px; font-size: 13px; font-family: 'Consolas', 'Segoe UI', monospace; line-height: 1.6;
+             }
+         """)
+-        # 기존 생성된 전자책 원고 불러오기
+-        existing_ebook = BATCH_OUT / "ebook-01.md"
+-        if existing_ebook.exists():
+-            self.txt_ebook.setPlainText(existing_ebook.read_text(encoding="utf-8"))
+         layout.addWidget(self.txt_ebook)
+ 
+         # 하단 액션 바
+@@ -1052,6 +1049,9 @@ class YunseulLMMStudio(QWidget):
+         self.txt_ebook.textChanged.connect(lambda: self.lbl_word_count.setText(f"글자 수: {len(self.txt_ebook.toPlainText()):,}자"))
+         bot_bar.addWidget(self.lbl_word_count)
+         bot_bar.addStretch()
++        btn_new = QPushButton("📝 새로 작성")
++        btn_new.clicked.connect(self.new_ebook_workspace)
++        bot_bar.addWidget(btn_new)
+ 
+         btn_save = QPushButton("💾 원고 임시저장")
+         btn_save.setStyleSheet("background-color: #1e293b; color: white; border: 1px solid #475569; border-radius: 6px; padding: 6px 14px;")
+@@ -1079,7 +1079,19 @@ class YunseulLMMStudio(QWidget):
+         btn_open_books.clicked.connect(lambda: os.startfile(str(BOOKS_DIR)))
+         bot_bar.addWidget(btn_open_books)
+         layout.addLayout(bot_bar)
+-
++        self._ebook_restoring = True
++        self._ebook_draft_path = BATCH_OUT / "ebook-session.json"
++        self._ebook_autosave = QTimer(self)
++        self._ebook_autosave.setSingleShot(True)
++        self._ebook_autosave.timeout.connect(self._save_ebook_workspace)
++        self._restore_ebook_workspace()
++        for field in (self.edit_topic, self.edit_ebook_persona):
++            field.textChanged.connect(self._queue_ebook_autosave)
++        self.txt_ebook.textChanged.connect(self._queue_ebook_autosave)
++        self.combo_length.currentIndexChanged.connect(self._queue_ebook_autosave)
++        self.combo_ebook_genre.currentIndexChanged.connect(self._queue_ebook_autosave)
++        self.spin_ebook_pages.valueChanged.connect(self._queue_ebook_autosave)
++        self._ebook_restoring = False
+         return w
+ 
+     # -------------------------------------------------------------------------
+@@ -1101,16 +1113,15 @@ class YunseulLMMStudio(QWidget):
+ 
+         self.list_sources = QListWidget()
+         self.list_sources.setStyleSheet("background-color: #0f172a; color: white; border: 1px solid #1e293b; border-radius: 8px;")
+-        src_dir = BASE_DIR / "blog_sources"
+-        if src_dir.exists():
+-            for f in src_dir.glob("*.md"):
+-                self.list_sources.addItem(f.name)
+         left_layout.addWidget(self.list_sources)
+ 
+         btn_add_doc = QPushButton("➕ 파일 추가")
+         btn_add_doc.setStyleSheet("background-color: #1e293b; color: white; border: 1px solid #475569; border-radius: 6px; padding: 5px;")
+         btn_add_doc.clicked.connect(self.add_source_file)
+         left_layout.addWidget(btn_add_doc)
++        btn_clear_merge = QPushButton("새 병합 작업 (입력/결과 비우기)")
++        btn_clear_merge.clicked.connect(self.clear_merge_workspace)
++        left_layout.addWidget(btn_clear_merge)
+         splitter.addWidget(left_pane)
+ 
+         # 우측: 재구성 프롬프트 & 결과 에디터
+@@ -1120,7 +1131,8 @@ class YunseulLMMStudio(QWidget):
+ 
+         prompt_box = QHBoxLayout()
+         prompt_box.addWidget(QLabel("통합 지침:"))
+-        self.edit_merge_prompt = QLineEdit("원문들의 핵심 통찰을 종합하여 '2026 자율 AI 에이전트와 순차 배치가 여는 미래'로 재구성하라")
++        self.edit_merge_prompt = QLineEdit()
++        self.edit_merge_prompt.setPlaceholderText("이번 작업의 통합 지침을 입력하세요")
+         self.edit_merge_prompt.setStyleSheet("background-color: #1e293b; color: white; border: 1px solid #334155; border-radius: 6px; padding: 6px 10px;")
+         prompt_box.addWidget(self.edit_merge_prompt)
+ 
+@@ -1132,9 +1144,6 @@ class YunseulLMMStudio(QWidget):
+ 
+         self.txt_merge_res = QTextEdit()
+         self.txt_merge_res.setStyleSheet("background-color: #0f172a; color: #f1f5f9; border: 1px solid #1e293b; border-radius: 8px; padding: 10px; font-size: 13px;")
+-        existing_rewrite = BATCH_OUT / "rewrite-01.md"
+-        if existing_rewrite.exists():
+-            self.txt_merge_res.setPlainText(existing_rewrite.read_text(encoding="utf-8"))
+         right_layout.addWidget(self.txt_merge_res)
+ 
+         m_bot_bar = QHBoxLayout()
+@@ -1267,8 +1276,11 @@ class YunseulLMMStudio(QWidget):
+         form_filter = QHBoxLayout()
+         form_filter.addWidget(QLabel("장르 필터:"))
+         self.combo_genre_filter = QComboBox()
+-        self.combo_genre_filter.addItem("🎯 K-pop 및 감성 발라드만 선별 학습 (타 장르 자동 PASS - 권장)", "kpop_ballad")
+-        self.combo_genre_filter.addItem("🌐 모든 장르 제한 없이 학습 (전체 포함)", "all")
++        from training_genres import GENRES
++        for key, (label, _) in GENRES.items():
++            self.combo_genre_filter.addItem(label, key)
++        self.combo_genre_filter.addItem("기존 K-pop/발라드 자동 선별 (타 장르 제외)", "kpop_ballad")
++        self.combo_genre_filter.setToolTip("장르 지정은 선택 파일의 학습 라벨입니다. 전체 장르는 태그/파일명에서 확인하며 불명확하면 일반 음악으로 표기합니다.")
+         self.combo_genre_filter.setStyleSheet("""
+             QComboBox {
+                 background-color: #1e293b; color: white; border: 1px solid #334155;
+@@ -1654,6 +1666,70 @@ class YunseulLMMStudio(QWidget):
+     # -------------------------------------------------------------------------
+     # Actions: eBook Generation
+     # -------------------------------------------------------------------------
++    def _queue_ebook_autosave(self, *_):
++        if not self._ebook_restoring:
++            self._ebook_autosave.start(400)
++
++    def _save_ebook_workspace(self):
++        from workspace_state import save_draft
++        state = {"topic": self.edit_topic.text(), "body": self.txt_ebook.toPlainText(),
++                 "persona": self.edit_ebook_persona.text(), "pages": self.spin_ebook_pages.value(),
++                 "genre": self.combo_ebook_genre.currentData(), "length": self.combo_length.currentIndex()}
++        try:
++            save_draft(self._ebook_draft_path, state)
++        except OSError as exc:
++            self.lbl_word_count.setText(f"자동 저장 실패: {exc}")
++            return False
++        return True
++
++    def _restore_ebook_workspace(self):
++        from workspace_state import load_draft
++        state = load_draft(self._ebook_draft_path)
++        self.edit_topic.setText(str(state.get("topic", "")))
++        self.txt_ebook.setPlainText(str(state.get("body", "")))
++        self.edit_ebook_persona.setText(str(state.get("persona", "")))
++        try:
++            self.spin_ebook_pages.setValue(int(state.get("pages", 0)))
++            self.combo_length.setCurrentIndex(max(0, min(self.combo_length.count()-1, int(state.get("length", 0)))))
++        except (ValueError, TypeError):
++            pass
++        idx = self.combo_ebook_genre.findData(state.get("genre"))
++        if idx >= 0:
++            self.combo_ebook_genre.setCurrentIndex(idx)
++
++    def new_ebook_workspace(self):
++        if getattr(self, "ebook_worker", None) and self.ebook_worker.isRunning():
++            QMessageBox.information(self, "집필 중", "집필 중단이 완료된 후 새로 작성하세요.")
++            return
++        if self.txt_ebook.toPlainText().strip() or self.edit_topic.text().strip():
++            if QMessageBox.question(self, "새로 작성", "현재 원고를 백업하고 새 원고로 시작할까요?") != QMessageBox.StandardButton.Yes:
++                return
++        self._ebook_autosave.stop()
++        if not self._save_ebook_workspace():
++            QMessageBox.warning(self, "저장 실패", "현재 원고를 저장하지 못해 초기화를 중단했습니다.")
++            return
++        if self.txt_ebook.toPlainText().strip() or self.edit_topic.text().strip():
++            import uuid
++            backup = self._ebook_draft_path.with_name("ebook-backup-" + uuid.uuid4().hex + ".json")
++            try:
++                shutil.copy2(self._ebook_draft_path, backup)
++            except OSError as exc:
++                QMessageBox.warning(self, "백업 실패", str(exc))
++                return
++        self._ebook_restoring = True
++        self.edit_topic.clear()
++        self.txt_ebook.clear()
++        self.edit_ebook_persona.clear()
++        self.combo_length.setCurrentIndex(0)
++        self.combo_ebook_genre.setCurrentIndex(0)
++        self.spin_ebook_pages.setValue(0)
++        self.lbl_ebook_persona.clear()
++        self.frame_ebook_progress.hide()
++        self.pbar_ebook.setValue(0)
++        self._ebook_restoring = False
++        self._save_ebook_workspace()  # empty tombstone prevents old draft resurrection
++        self.edit_topic.setFocus()
++
+     def _on_ebook_genre_changed(self):
+         key = self.combo_ebook_genre.currentData()
+         d = ebook_persona.persona_dict(key)
+@@ -1757,6 +1833,7 @@ class YunseulLMMStudio(QWidget):
+ 
+     def on_ebook_chapter_done(self, ch_title, ch_content, full_accumulated_text):
+         self.txt_ebook.setPlainText(full_accumulated_text)
++        self._save_ebook_workspace()
+         sb = self.txt_ebook.verticalScrollBar()
+         sb.setValue(sb.maximum())
+ 
+@@ -1886,9 +1963,25 @@ class YunseulLMMStudio(QWidget):
+     def add_source_file(self):
+         path, _ = QFileDialog.getOpenFileName(self, "참고 원문 파일 선택", "", "Markdown/Text (*.md *.txt);;All Files (*)")
+         if path:
+-            self.list_sources.addItem(Path(path).name)
++            item = QListWidgetItem(Path(path).name)
++            item.setData(Qt.ItemDataRole.UserRole, str(Path(path).resolve()))
++            item.setToolTip(str(Path(path).resolve()))
++            self.list_sources.addItem(item)
++
++    def clear_merge_workspace(self):
++        if getattr(self, "merge_worker", None) and self.merge_worker.isRunning():
++            QMessageBox.information(self, "작업 중", "병합 완료 후 새 작업을 시작하세요.")
++            return
++        self.list_sources.clear()
++        self.edit_merge_prompt.clear()
++        self.txt_merge_res.clear()
+ 
+     def start_merge_generation(self):
++        if getattr(self, "merge_worker", None) and self.merge_worker.isRunning():
++            return
++        if not self.list_sources.count() or not self.edit_merge_prompt.text().strip():
++            QMessageBox.warning(self, "입력 필요", "이번 작업의 원문 파일과 통합 지침을 입력하세요.")
++            return
+         if not self.is_server_alive():
+             QMessageBox.warning(self, "서버 미실행", "Ollama 서버를 먼저 켜주세요.")
+             return
+@@ -1901,12 +1994,15 @@ class YunseulLMMStudio(QWidget):
+         instruction = self.edit_merge_prompt.text().strip()
+         # 원문 내용 모으기
+         sources_text = ""
+-        src_dir = BASE_DIR / "blog_sources"
+         for i in range(self.list_sources.count()):
+-            fname = self.list_sources.item(i).text()
+-            fpath = src_dir / fname
+-            if fpath.exists():
+-                sources_text += f"\n\n[참고 자료: {fname}]\n" + fpath.read_text(encoding="utf-8")
++            item = self.list_sources.item(i)
++            fpath = Path(item.data(Qt.ItemDataRole.UserRole) or "")
++            try:
++                content = fpath.read_text(encoding="utf-8-sig")
++            except (OSError, UnicodeError) as exc:
++                QMessageBox.warning(self, "원문 읽기 실패", f"{item.text()}: {exc}")
++                return
++            sources_text += f"\n\n[참고 자료: {fpath.name}]\n" + content
+ 
+         prompt = f"다음 자료들을 바탕으로 지침에 따라 하나의 분석글로 재구성하라:\n\n{sources_text}\n\n[지침]\n{instruction}\n- 1,500자 이상 서술\n- 말미 출처 명시"
+ 
+@@ -2053,7 +2149,7 @@ class YunseulLMMStudio(QWidget):
+             return
+ 
+         preset = self.combo_train_preset.currentData() or "standard"
+-        genre_filter = self.combo_genre_filter.currentData() or "kpop_ballad"
++        genre_filter = self.combo_genre_filter.currentData() or "all"
+         audio_files = [self.list_train_files.item(i).text() for i in range(self.list_train_files.count())]
+ 
+         self.btn_start_train.setEnabled(False)
+@@ -2180,6 +2276,8 @@ class YunseulLMMStudio(QWidget):
+             self.clean_exit()
+ 
+     def clean_exit(self):
++        self._ebook_autosave.stop()
++        self._save_ebook_workspace()
+         # 0. 백그라운드 스레드 및 타이머 안전 정지
+         if hasattr(self, "ebook_timer") and self.ebook_timer.isActive():
+             self.ebook_timer.stop()
+diff --git a/workspace_state.py b/workspace_state.py
+new file mode 100644
+index 0000000..7c5db18
+--- /dev/null
++++ b/workspace_state.py
+@@ -0,0 +1,28 @@
++"""Atomic local ebook draft storage (never imports shipped sample content)."""
++import json
++import os
++import tempfile
++from pathlib import Path
++
++
++def save_draft(path, state):
++    path = Path(path)
++    path.parent.mkdir(parents=True, exist_ok=True)
++    fd, tmp = tempfile.mkstemp(prefix="draft-", suffix=".tmp", dir=str(path.parent))
++    try:
++        with os.fdopen(fd, "w", encoding="utf-8") as f:
++            json.dump({"version": 1, **state}, f, ensure_ascii=False, indent=2)
++            f.flush()
++            os.fsync(f.fileno())
++        os.replace(tmp, path)
++    finally:
++        if os.path.exists(tmp):
++            os.unlink(tmp)
++
++
++def load_draft(path):
++    try:
++        state = json.loads(Path(path).read_text(encoding="utf-8"))
++        return state if isinstance(state, dict) and state.get("version") == 1 else {}
++    except (OSError, ValueError):
++        return {}

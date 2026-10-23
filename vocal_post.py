@@ -67,6 +67,8 @@ def encode(y: np.ndarray, sr: int = SR) -> bytes:
     if y.ndim == 1:
         y = y[:, None]
     y = np.ascontiguousarray(y.astype(np.float32))
+    if not np.isfinite(y).all():
+        raise ValueError("오디오에 NaN/Inf가 포함되어 저장을 중단했습니다.")
     return subprocess.run(
         [ffmpeg_bin(), "-v", "error", "-f", "f32le", "-ar", str(sr),
          "-ac", str(y.shape[1]), "-i", "-", "-c:a", "pcm_s16le", "-f", "wav", "-"],
@@ -129,12 +131,8 @@ def deharsh(y: np.ndarray, sr: int, amount: float, frame: int = 2048, hop: int =
     bell = np.exp(-(lf ** 2) / (2 * 0.42 ** 2))
     bell[freqs < 1500] = 0.0
     gain = 1.0 - (amount * 0.55) * bell
-    out = y.astype(np.float32).copy()
-    for ch in range(y.shape[1]):
-        spec = _stft(out[:, ch], frame, hop)
-        spec *= gain[None, :]
-        out[:, ch] = _istft(spec, frame, hop, n=len(out)).astype(np.float32)
-    return out
+    from audio_dsp_safe import spectral_gain
+    return spectral_gain(y, gain, frame, hop)
 
 
 # ---------------------------------------------------------------- 2) 레가토(엔벨로프 완만화)
@@ -144,20 +142,23 @@ def legato(y: np.ndarray, sr: int, amount: float, win_ms: float = 46.0) -> np.nd
         return y
     hop = max(1, int(sr * 0.010))
     mono = y.mean(axis=1).astype(np.float32)
-    n = 1 + len(mono) // hop
+    if not len(mono):
+        return y.copy()
+    n = (len(mono) + hop - 1) // hop
     env = np.empty(n, dtype=np.float32)
     for i in range(n):
         seg = mono[i * hop:(i + 1) * hop]
         env[i] = float(np.sqrt(np.mean(seg.astype(np.float64) ** 2) + 1e-12))
     w = max(1, int(win_ms / 10.0))
     kernel = np.ones(w, dtype=np.float32) / w
-    smooth = np.convolve(env, kernel, mode="same")
+    from audio_dsp_safe import smooth_edge
+    smooth = smooth_edge(env, w)
     gain = np.clip((smooth + 1e-6) / (env + 1e-6), 0.30, 3.0)
     gain = 1.0 + (gain - 1.0) * amount          # 보정 강도
     # 프레임 게인을 샘플 단위로 보간
     centers = np.arange(n) * hop + hop // 2
     gi = np.interp(np.arange(len(mono)), centers, gain)
-    gi = np.convolve(gi, np.ones(64, dtype=np.float32) / 64, mode="same")
+    gi = smooth_edge(gi, 64)
     out = y.astype(np.float32).copy()
     for ch in range(out.shape[1]):
         out[:, ch] *= gi.astype(np.float32)

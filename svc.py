@@ -9,7 +9,7 @@ svc.py - 생성된 노래의 '보컬 음색'을 내 목소리 쪽으로 옮기�
           실제 신경망 변환을 수행한다. 이 경로만이 '진짜 음색 복제'에 해당한다.
           필요: audio_engines/RVC (RVC-WebUI), assets/weights/<name>.pth
 2) dsp  : 설치 없이도 항상 동작하는 근사 변환.
-          - 내 목소리 프로필의 f0 대역으로 곡 전체를 ±2반음 이내에서 이동(멜로디 유지)
+          - 기본: 원곡 가창 음정 보존. 낭독 f0로 강제 이동하지 않음
           - 내 발화의 평균 스펙트럼 포락선과 곡 보컬의 차이를 EQ 로 보정 (음색 결)
           - HNR(숨소리) 차이를 고역 공기감/디에서로 완만하게 보정
           ※ dsp 는 '음색 근사'이며 화자 복제가 아니다. 이 점을 결과 리포트에 명시한다.
@@ -57,14 +57,16 @@ def decode(path, sr: int = SR, ch: int = 2):
     return np.ascontiguousarray(y.reshape(-1, ch))
 
 
-def write_wav(y, path, sr: int = SR):
+def write_wav(y, path, sr: int = SR, codec="pcm_s24le"):
     y = np.ascontiguousarray(np.asarray(y, dtype=np.float32))
     if y.ndim == 1:
         y = y[:, None]
+    if not np.isfinite(y).all():
+        raise ValueError("오디오에 NaN/Inf가 포함되어 저장을 중단했습니다.")
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     raw = subprocess.run(
-        [_ffmpeg(), "-v", "error", "-f", "f32le", "-ar", str(sr), "-ac", str(y.shape[1]),
-         "-i", "-", "-c:a", "pcm_s24le", "-f", "wav", str(path)],
+        [_ffmpeg(), "-y", "-v", "error", "-f", "f32le", "-ar", str(sr), "-ac", str(y.shape[1]),
+         "-i", "-", "-c:a", codec, "-f", "wav", str(path)],
         input=y.tobytes(), capture_output=True)
     if raw.returncode != 0:
         raise RuntimeError("WAV 저장 실패: " + raw.stderr.decode("utf-8", "replace")[-300:])
@@ -87,10 +89,11 @@ def find_rvc_model(name: str):
     root = rvc_root()
     if not root:
         return None, None
-    weights = list((root / "assets" / "weights").rglob(f"{name}*.pth")) if \
+    weights = list((root / "assets" / "weights").rglob("*.pth")) if \
         (root / "assets" / "weights").exists() else []
     index = list((root / "logs").rglob(f"{name}*/*.index")) if (root / "logs").exists() else []
-    return (weights[0] if weights else None), (index[0] if index else None)
+    exact = [p for p in weights if p.stem == name]
+    return (exact[0] if len(exact) == 1 else None), (index[0] if len(index) == 1 else None)
 
 
 def rvc_available(name: str) -> bool:
@@ -145,7 +148,7 @@ def _spectral_envelope(y, sr: int, n_fft: int = 4096, bands: int = 48):
     for i in range(bands):
         m = (freqs >= edges[i]) & (freqs < edges[i + 1])
         out[i] = avg[m].mean() if m.any() else avg[np.argmin(np.abs(freqs - edges[i]))]
-    return 20 * np.log10(out + 1e-12), (edges[:-1] + edges[1:]) / 2
+    return 10 * np.log10(out + 1e-12), (edges[:-1] + edges[1:]) / 2
 
 
 def _f0_median(y, sr: int) -> float:
@@ -168,31 +171,12 @@ def _f0_median(y, sr: int) -> float:
 
 
 def _apply_eq_curve(y, sr: int, freqs, gains_db):
-    """밴드별 게인을 주파수 응답으로 만들어 STFT 에 적용."""
+    from audio_dsp_safe import spectral_gain
     n_fft, hop = 4096, 1024
-    out = y.astype(np.float32).copy()
     ff = np.fft.rfftfreq(n_fft, 1.0 / sr)
     curve = np.interp(ff, freqs, gains_db, left=gains_db[0], right=gains_db[-1])
-    gain = 10 ** (curve / 20.0)
-    win = np.hanning(n_fft).astype(np.float32)
-    for ch in range(y.shape[1]):
-        x = out[:, ch]
-        if len(x) < n_fft * 2:
-            continue
-        spec = np.fft.rfft(np.lib.stride_tricks.sliding_window_view(x, n_fft)[::hop] * win, axis=1)
-        spec *= gain[None, :]
-        frames = np.fft.irfft(spec, n=n_fft, axis=1).astype(np.float32)
-        acc = np.zeros(len(x) + n_fft, dtype=np.float32)
-        nrm = np.zeros(len(x) + n_fft, dtype=np.float32)
-        for i, f in enumerate(frames):
-            a = i * hop
-            acc[a:a + n_fft] += f * win
-            nrm[a:a + n_fft] += win ** 2
-        out[:, ch] = (acc / np.maximum(nrm, 1e-6))[: len(x)]
-    peak = float(np.max(np.abs(out))) if out.size else 0.0
-    if peak > 0.999:
-        out *= 0.999 / peak
-    return out
+    return spectral_gain(y, 10 ** (curve / 20.0), n_fft, hop)
+
 
 
 def _pitch_shift(y, sr: int, semitones: float):
@@ -234,12 +218,12 @@ def _pitch_shift(y, sr: int, semitones: float):
 
 def convert_dsp(vocal_path, profile: dict, out_wav) -> dict:
     y = decode(vocal_path, SR, 2)
-    notes = []
-    # 1) 음역 정렬 (멜로디 유지 위해 ±2반음 제한)
+    notes = [] if profile.get("allow_singing_transpose", False) else ["낭독 음역으로 강제 하향하지 않음: 원곡 멜로디/음정 유지"]
+    # 1) 원곡 음정 보존. 명시적으로 허용한 프로필만 전체 ±2반음 이동
     target = float(profile.get("f0_median_hz") or 0)
     cur = _f0_median(y, SR)
     semis = 0.0
-    if target > 0 and cur > 0:
+    if profile.get("allow_singing_transpose", False) and target > 0 and cur > 0:
         semis = 12 * math.log2(target / cur)
         semis = max(-2.0, min(2.0, semis))
         if abs(semis) < 0.25:
@@ -256,11 +240,11 @@ def convert_dsp(vocal_path, profile: dict, out_wav) -> dict:
         env_s, freqs = _spectral_envelope(speech, SR)
         env_v, _ = _spectral_envelope(y, SR)
         diff = env_s - env_v
-        # 저역/고역 과보정 방지: ±6dB 클램프 + 스무딩
-        diff = np.clip(diff, -6.0, 6.0)
+        # 발화 음색으로 가창을 과보정하지 않도록 ±3dB 클램프 + 약한 적용
+        diff = np.clip(diff, -3.0, 3.0)
         k = np.ones(5) / 5.0
         diff = np.convolve(diff, k, mode="same")
-        env_gain = 0.7  # 100% 적용하면 부자연스러움
+        env_gain = 0.35  # 100% 적용하면 부자연스러움
         y = _apply_eq_curve(y, SR, freqs, diff * env_gain)
         notes.append(f"내 목소리 평균 음색에 맞춰 밴드 EQ 보정(최대 ±{np.max(np.abs(diff) * env_gain):.1f}dB)")
     # 3) 숨소리(HNR) 방향 보정
@@ -287,9 +271,7 @@ def convert_vocal(vocal_path, profile_path, out_wav, backend: str = "auto") -> d
         except Exception as e:  # noqa: BLE001
             if backend == "rvc":
                 raise
-            res = convert_dsp(vocal_path, profile, out_wav)
-            res["rvc_error"] = str(e)[:300]
-            return res
+            raise RuntimeError("학습된 RVC 변환 실패: 다른 음색으로 대체하지 않고 원본을 유지합니다.") from e
     if backend == "rvc":
         raise RuntimeError("RVC 모델을 찾지 못했습니다 (audio_engines/RVC, assets/weights).")
     return convert_dsp(vocal_path, profile, out_wav)

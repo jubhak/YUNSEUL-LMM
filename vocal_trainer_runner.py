@@ -345,6 +345,13 @@ def analyze_music(path: Path, max_sec: float):
 
 
 def build_caption(category: str, bpm, is_instrumental: bool):
+    from training_genres import GENRES, caption_for
+    if category in GENRES or category == "unknown":
+        base = caption_for(category)
+        if is_instrumental:
+            base = base.replace(", clear lead vocal", "").replace(", lead vocal", "").replace(", expressive lead vocal", "")
+            base += ", instrumental"
+        return base
     if "발라드" in category and "K-pop" not in category:
         base = "emotional Korean ballad, piano and strings, expressive lead vocal, clear diction"
     elif "댄스" in category:
@@ -444,7 +451,7 @@ def train_speech_voice(args) -> int:
             log(f"  ⚠️ 변환 실패 {src.name}: {e}")
             continue
         caption = (f"{trigger}, dry studio close-mic a cappella {gender_en} vocal, "
-                   "natural Korean singing voice, clear diction, no instruments, no reverb")
+                   "natural Korean spoken voice, speaker identity reference, clear diction, no instruments, no reverb")
         samples.append({
             "audio_path": str(dst), "filename": dst.name, "caption": caption,
             "lyrics": f"[Verse]\n{text}", "bpm": 72, "keyscale": "",
@@ -538,7 +545,7 @@ def main():
     parser.add_argument("--file-list", default=None)
     parser.add_argument("--audio-files", nargs="*", default=[])
     parser.add_argument("--preset", default="standard", choices=["fast", "standard", "deep"])
-    parser.add_argument("--genre-filter", default="kpop_ballad", choices=["kpop_ballad", "all"])
+    parser.add_argument("--genre-filter", default="all", choices=["kpop_ballad", "all", "trot", "ballad", "kpop", "rock", "rnb", "hiphop", "jazz", "folk", "electronic", "classical", "gospel"])
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--skip-train", action="store_true", help="데이터셋만 만들고 학습은 생략 (점검용)")
     parser.add_argument("--mode", default="songs", choices=["songs", "speech"])
@@ -614,7 +621,8 @@ def main():
                 log(f"  ⏭️ PASS ({reason}): {af.name}")
                 continue
         else:
-            category = "K-pop/발라드"
+            from training_genres import detect_genre
+            category = detect_genre(af) if args.genre_filter == "all" else args.genre_filter
         todo.append((af, sig, category))
         if idx % 10 == 0:
             progress(1, 2 + int(idx / max(1, len(audio_files)) * 10), f"[1/5] 선별 중 ({idx + 1}/{len(audio_files)})")

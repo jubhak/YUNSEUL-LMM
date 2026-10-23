@@ -52,6 +52,8 @@ def main() -> int:
     ap.add_argument("--genre", default="ballad_piano")
     ap.add_argument("--genre-name", default="")
     ap.add_argument("--moods", nargs="*", default=[])
+    ap.add_argument("--vocal-stem", default=None, help="분리된 보컬 WAV (반주와 함께 지정)")
+    ap.add_argument("--instrumental-stem", default=None, help="분리된 반주 WAV")
     ap.add_argument("--profile", default=None, help="voice_profile.json 경로")
     ap.add_argument("--svc-backend", default="auto", choices=["auto", "rvc", "dsp", "off"])
     ap.add_argument("--polish", default="natural", choices=["off", "soft", "natural", "rich"])
@@ -80,8 +82,22 @@ def main() -> int:
     tmpdir = Path(tempfile.mkdtemp(prefix="finalize_"))
     stage_in = src
 
+    from vocal_pipeline import prepare_stems, remix
+    vocal_stem = backing_stem = None
+    try:
+        vocal_stem, backing_stem = prepare_stems(src, tmpdir, args.vocal_stem, args.instrumental_stem)
+        if vocal_stem:
+            stage_in = vocal_stem
+            report["steps"]["separation"] = {"vocal": str(vocal_stem), "backing": str(backing_stem)}
+        else:
+            report["warnings"].append("Demucs/보컬 스템 없음: 반주 보호를 위해 음색 변환·보컬 코치를 건너뜁니다.")
+    except Exception as exc:
+        report["warnings"].append(f"보컬 분리 실패: 원본 보존 ({exc})")
+    vocal_ready = vocal_stem is not None and backing_stem is not None
+    report["steps"].setdefault("separation", {"skipped": True})
+
     # ---------------------------------------------------------------- 1) SV C
-    if args.profile and args.svc_backend != "off" and Path(args.profile).exists():
+    if vocal_ready and args.profile and args.svc_backend != "off" and Path(args.profile).exists():
         progress(10, "내 목소리 음색으로 변환 중...")
         try:
             import svc  # 같은 폴더
@@ -103,14 +119,14 @@ def main() -> int:
     # ---------------------------------------------------------------- 2) 다듬기
     # 2a) 가수 코치: 비브라토·프레이즈 다이내믹·싱어 포먼트 (근거: VibE-SVC 2025,
     #     ICASSP 2022 비브라토 모델링, Roebel ICASSP 2012 여기 성분 변조)
-    if args.singer_intensity and args.singer_intensity > 0:
-        progress(30, "가수처럼 다듬는 중 (비브라토·다이내믹·싱어포먼트)...")
+    if vocal_ready and args.singer_intensity and args.singer_intensity > 0:
+        progress(30, "보컬 다듬는 중 (원곡 음정 보존·다이내믹·음색)...")
         try:
             import vocal_coach
-            out_star = tmpdir / "star.mp3"
+            out_star = tmpdir / "star.wav"
             r = vocal_coach.polish_star(str(stage_in), str(out_star),
                                         preset=args.singer_style,
-                                        intensity=args.singer_intensity)
+                                        intensity=args.singer_intensity, preserve_melody=True)
             stage_in = out_star
             report["steps"]["singer_coach"] = {
                 "preset": args.singer_style, "intensity": args.singer_intensity,
@@ -127,15 +143,16 @@ def main() -> int:
     else:
         report["steps"]["singer_coach"] = {"skipped": True}
 
-    if args.polish != "off":
-        progress(35, "부드럽게 다듬는 중 (레가토·피치·리버브·마스터)...")
+    coach_result = report["steps"].get("singer_coach", {})
+    coach_not_applied = bool(coach_result.get("error") or coach_result.get("skipped"))
+    if vocal_ready and args.polish != "off" and coach_not_applied:
+        progress(35, "부드럽게 다듬는 중 (음정 보존·레가토·리버브)...")
         try:
             import vocal_post
-            out2 = tmpdir / "polished.mp3"
-            # 가수 코치를 이미 적용했다면 거친 대역/레가토/리버브/마스터만 다시 한다
+            out2 = tmpdir / "polished.wav"
+            # 코치 체인을 적용했으면 중복 EQ/리버브/압축은 하지 않는다
             r = vocal_post.polish_song(str(stage_in), str(out2), preset=args.polish,
-                                       double_track_path=args.double_track,
-                                       pitch=not (args.singer_intensity and args.singer_intensity > 0))
+                                       double_track_path=None, pitch=False)
             stage_in = out2
             report["steps"]["polish"] = r
             log(f"• 다듬기({args.polish}) 완료 · 단계 {', '.join(r.get('stages', []))}")
@@ -149,11 +166,24 @@ def main() -> int:
     else:
         report["steps"]["polish"] = {"skipped": True}
 
+    if vocal_ready:
+        try:
+            remixed = tmpdir / "remixed.wav"
+            report["steps"]["remix"] = remix(stage_in, vocal_stem, backing_stem, remixed)
+            stage_in = remixed
+        except Exception as exc:
+            stage_in = src
+            report["warnings"].append(f"리믹스 실패: 원본 사용 ({exc})")
+    if args.double_track:
+        report["warnings"].append("독립 테이크 겹치기는 화자/박자 불일치를 유발할 수 있어 적용하지 않았습니다.")
+
     # 최종 오디오 확정 (mp3 로 통일)
     final_audio = tmpdir / "final.mp3"
     try:
         ff = shutil.which("ffmpeg")
-        if ff:
+        if stage_in == src and src.suffix.lower() == ".mp3":
+            shutil.copy2(src, final_audio)
+        elif ff:
             subprocess.run([ff, "-y", "-v", "error", "-i", str(stage_in), "-c:a", "libmp3lame",
                             "-b:a", "320k", str(final_audio)], check=True)
         else:
