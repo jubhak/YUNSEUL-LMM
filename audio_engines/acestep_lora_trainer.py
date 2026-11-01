@@ -11,6 +11,7 @@ stdout 프로토콜 (vocal_trainer_runner.py 가 위젯으로 중계):
   [LOG] 메시지 / [PROGRESS:단계:퍼센트:제목] / [ADAPTER:경로] / [FINAL_LOSS:값]
 """
 import argparse
+import json
 import os
 import sys
 import time
@@ -34,6 +35,37 @@ def log(msg):
 
 def progress(stage, pct, title):
     print(f"[PROGRESS:{stage}:{int(pct)}:{title}]", flush=True)
+
+
+def dataset_diversity_report(dataset_json: Path, n_tensors: int) -> dict:
+    """학습 데이터가 '한 곡 반복'이면 LoRA 가 단조로운 평균만 배운다. 그 위험을 수치로 남긴다."""
+    report = {"tensors": n_tensors, "samples": 0, "distinct_captions": 0,
+              "distinct_keys": 0, "distinct_bpm": 0, "avg_duration_sec": None, "warnings": []}
+    try:
+        data = json.loads(Path(dataset_json).read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        report["warnings"].append(f"dataset.json 을 읽지 못했습니다: {exc}")
+        return report
+    samples = data.get("samples") or []
+    report["samples"] = len(samples)
+    captions = {(s.get("caption") or "").strip() for s in samples}
+    keys = {(s.get("keyscale") or "").strip() for s in samples}
+    bpms = {s.get("bpm") for s in samples}
+    durations = [float(s.get("duration") or 0) for s in samples if s.get("duration")]
+    report.update(distinct_captions=len(captions), distinct_keys=len(keys), distinct_bpm=len(bpms))
+    if durations:
+        report["avg_duration_sec"] = round(sum(durations) / len(durations), 1)
+    if samples and len(captions) == 1:
+        report["warnings"].append(
+            "모든 학습 곡의 caption 이 동일합니다. LoRA 가 편곡 차이를 배우지 못해 결과가 단조로워집니다. "
+            "training_genres.caption_variant() 로 곡마다 다른 전개 서술을 넣으세요.")
+    if samples and len(bpms) <= 1:
+        report["warnings"].append("학습 곡의 BPM 이 한 값뿐입니다. 템포/그루브 다양성이 학습되지 않습니다.")
+    if durations and sum(durations) / len(durations) < 30:
+        report["warnings"].append(
+            "평균 학습 길이가 30초 미만입니다. 한 구간만 배우면 곡 전체가 같은 마디를 반복합니다 "
+            "(max-duration 을 늘리거나 곡당 여러 구간을 넣으세요).")
+    return report
 
 
 def install_audio_loader():
@@ -107,6 +139,17 @@ def main() -> int:
         torch.cuda.empty_cache()
     n_pt = len([p for p in Path(args.tensor_dir).glob("*.pt") if not p.name.endswith(".tmp.pt")])
     log(f"  ✓ 전처리 완료: 신규 {res.get('processed', 0)}곡, 실패 {res.get('failed', 0)}곡, 학습 텐서 총 {n_pt}개")
+
+    # 단조로움의 뿌리는 대개 '데이터'다. 학습 전에 진단을 남긴다.
+    report = dataset_diversity_report(Path(args.dataset_json), n_pt)
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "dataset_report.json").write_text(
+        json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    log(f"  • 데이터 다양성: caption {report['distinct_captions']}종 / BPM {report['distinct_bpm']}종 "
+        f"/ 평균 길이 {report['avg_duration_sec']}초")
+    for w in report["warnings"]:
+        log(f"  ⚠️ {w}")
     if n_pt == 0:
         print("[ERROR] 학습 가능한 텐서가 없습니다.", flush=True)
         return 1

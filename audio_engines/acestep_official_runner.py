@@ -126,6 +126,24 @@ def load_adapter(dit, path: str, scale: float, evidence: dict, name: str = "voic
         evidence.update(lora_path=str(p), lora_scale=float(scale), lora_loaded=True)
 
 
+def with_overrides(params, **changes):
+    """GenerationParams 를 다른 테이크용으로 복제한다 (frozen dataclass 여도 안전)."""
+    try:
+        import dataclasses
+        if dataclasses.is_dataclass(params):
+            return dataclasses.replace(params, **changes)
+    except Exception:  # noqa: BLE001
+        pass
+    import copy
+    clone = copy.copy(params)
+    for k, v in changes.items():
+        try:
+            setattr(clone, k, v)
+        except Exception:  # noqa: BLE001
+            pass
+    return clone
+
+
 def lyric_alignment_scores(dit, extra: dict, n: int, language: str, steps: int) -> list:
     """ACE-Step 공식 DiT 가사 정렬 점수 (높을수록 가사가 음성에 정확히 실림)."""
     keys = {
@@ -174,6 +192,10 @@ def main() -> int:
     p.add_argument("--seed", type=int, default=-1)
     p.add_argument("--lm-model", default=None)
     p.add_argument("--lm-temperature", type=float, default=0.85)
+    p.add_argument("--take-variety", type=float, default=0.08,
+                   help="테이크마다 LM temperature 를 흔드는 폭 (구조가 겹치지 않게)")
+    p.add_argument("--no-variety", action="store_true",
+                   help="단조로움 측정/가중 선택을 끈다 (기본: 켜짐)")
     p.add_argument("--no-thinking", action="store_true", help="5Hz LM 없이 DiT 만 사용")
     p.add_argument("--require-lm", action="store_true",
                    help="LM 로드에 실패하면 폴백하지 않고 실패 처리")
@@ -224,6 +246,7 @@ def main() -> int:
         "duration_req": duration, "caption": caption, "lyrics_chars": len(lyrics),
         "bpm": args.bpm, "keyscale": args.keyscale, "candidates": candidates,
         "continuity_screen": "mix_energy_only_not_speaker_verification",
+        "take_variety": args.take_variety, "variety_ranking": not args.no_variety,
         "lm_loaded": False, "lm_model": None, "lora_loaded": False,
     }
 
@@ -287,7 +310,11 @@ def main() -> int:
     if has_lyrics:
         caption += (", one consistent solo lead singer throughout, stable vocal timbre, "
                     "smooth connected register transitions, preserve melodic contour, "
-                    "continuous accompaniment, balanced vocal level, no abrupt octave drops, no singer switching")
+                    "continuous accompaniment, balanced vocal level, no abrupt octave drops, no singer switching, "
+                    # 단조로움 방지: 구간마다 편곡이 실제로 달라지도록 요구한다
+                    "verse and chorus must differ in texture and rhythm, lift the chorus with higher register and "
+                    "fuller arrangement, bridge with a different chord progression, varied drum pattern per section, "
+                    "build dynamics across the song, avoid looping the same bar for the whole song")
     evidence["caption"] = caption  # actual prompt including continuity constraints
     params = GenerationParams(
         task_type=args.task_type,
@@ -313,30 +340,53 @@ def main() -> int:
         fade_out_duration=1.5,
         reference_audio=ref,
     )
-    config = GenerationConfig(batch_size=candidates, audio_format="flac",
-                              use_random_seed=args.seed < 0,
-                              seeds=None if args.seed < 0 else [args.seed + i for i in range(candidates)])
-
     log(f"곡 생성 시작 (duration={'auto' if duration < 0 else int(duration)}, steps={steps}, "
         f"shift={args.shift}, takes={candidates}, thinking={thinking}, "
         f"lora={'on' if evidence['lora_loaded'] else 'off'})...")
     t0 = time.time()
-    try:
-        result = generate_music(dit, llm, params=params, config=config, save_dir=str(tmp_dir))
-    except Exception as e:  # noqa: BLE001
-        fail(f"generate_music 예외: {type(e).__name__}: {e}")
+
+    # ---- 테이크를 '한 배치'가 아니라 '서로 다른 조건'으로 생성 ----
+    # 같은 배치로 뽑으면 테이크들이 구조까지 비슷해져 고르는 의미가 없다.
+    # 테이크마다 LM temperature 를 조금씩 흔들어 편곡/전개 자체를 다르게 만든다.
+    from audio_verify import analyze, monotony, verdict
+    audios, align, lm_meta = [], [], None
+    for i in range(candidates):
+        seed_i = (args.seed + i) if args.seed >= 0 else -1
+        temp_i = args.lm_temperature
+        if candidates > 1:
+            spread = (i - (candidates - 1) / 2.0) * max(0.0, args.take_variety)
+            temp_i = round(min(1.30, max(0.50, args.lm_temperature + spread)), 3)
+        params_i = with_overrides(params, seed=seed_i, lm_temperature=temp_i)
+        conf = GenerationConfig(batch_size=1, audio_format="flac",
+                                use_random_seed=seed_i < 0,
+                                seeds=None if seed_i < 0 else [seed_i])
+        log(f"  테이크 {i + 1}/{candidates}: seed={'random' if seed_i < 0 else seed_i}, lm_temp={temp_i}")
+        try:
+            result = generate_music(dit, llm, params=params_i, config=conf, save_dir=str(tmp_dir))
+        except Exception as e:  # noqa: BLE001
+            log(f"[경고] 테이크 {i + 1} 생성 예외: {type(e).__name__}: {e}")
+            continue
+        got = getattr(result, "audios", None) or []
+        if not (getattr(result, "success", False) and got):
+            log(f"[경고] 테이크 {i + 1} 실패: {getattr(result, 'status_message', '')}")
+            continue
+        extra = getattr(result, "extra_outputs", {}) or {}
+        if lm_meta is None:
+            lm_meta = extra.get("lm_metadata")
+        scores = (lyric_alignment_scores(dit, extra, len(got), args.vocal_language, steps)
+                  if has_lyrics else [None] * len(got))
+        for k, a in enumerate(got):
+            meta = dict(a.get("params") or {})
+            meta.update(take=i + 1, lm_temperature=temp_i, seed=meta.get("seed", None if seed_i < 0 else seed_i))
+            audios.append(dict(a, params=meta))
+            align.append(scores[k] if k < len(scores) else None)
     elapsed = time.time() - t0
     evidence["elapsed_sec"] = round(elapsed, 1)
-
-    audios = getattr(result, "audios", None) or []
-    if not (getattr(result, "success", False) and audios):
-        fail(f"생성 실패: {getattr(result, 'status_message', '')} / {getattr(result, 'error', '')}", 1)
+    if not audios:
+        fail(f"모든 테이크 생성 실패 ({elapsed:.1f}s). LM/DiT 로그를 확인하세요.", 1)
     log(f"생성 완료 ({elapsed:.1f}s, {len(audios)}개 테이크)")
 
     # ---- 테이크 검증 및 선택 ----
-    from audio_verify import analyze, verdict
-    align = lyric_alignment_scores(dit, getattr(result, "extra_outputs", {}) or {}, len(audios),
-                                   args.vocal_language, steps) if has_lyrics else [None] * len(audios)
     takes = []
     for i, a in enumerate(audios):
         f = Path(a.get("path") or "")
@@ -349,25 +399,45 @@ def main() -> int:
             info["continuity"] = continuity_metrics(f)
         except Exception as exc:
             info["continuity"] = {"penalty": 0, "unavailable": str(exc)[:200]}
+        if args.no_variety:
+            info["monotony"] = {"score": None, "penalty": 0, "disabled": True}
+        else:
+            try:
+                info["monotony"] = monotony(f)
+            except Exception as exc:  # noqa: BLE001
+                info["monotony"] = {"score": None, "penalty": 0, "unavailable": str(exc)[:200]}
         takes.append({"idx": i, "path": f, "verdict": v, "reasons": reasons, "analysis": info,
-                      "align": align[i] if i < len(align) else None, "seed": a.get("params", {}).get("seed")})
-        log(f"  take {i + 1}: 판정={v} 가사정렬={takes[-1]['align']} rms={info['rms']:.3f} "
-            f"flatness={info.get('median_flatness')}")
+                      "align": align[i] if i < len(align) else None,
+                      "seed": (a.get("params") or {}).get("seed"),
+                      "take": (a.get("params") or {}).get("take", i + 1)})
+        mono = info["monotony"].get("score")
+        log(f"  take {takes[-1]['take']}: 판정={v} 가사정렬={takes[-1]['align']} "
+            f"단조로움={mono} rms={info['rms']:.3f} flatness={info.get('median_flatness')}")
     if not takes:
         fail("생성된 음원 파일을 찾지 못했습니다.", 1)
 
-    takes.sort(key=lambda t: (t["verdict"] == "OK", -t["analysis"].get("continuity", {}).get("penalty", 0), t["align"] if t["align"] is not None else -1.0),
+    # 우선순위: 정상 음악 -> 가사가 제대로 실림 -> 드롭아웃 없음 -> 덜 단조로움
+    takes.sort(key=lambda t: (t["verdict"] == "OK",
+                              t["align"] if t["align"] is not None else -1.0,
+                              -(t["analysis"].get("continuity", {}) or {}).get("penalty", 0),
+                              -((t["analysis"].get("monotony", {}) or {}).get("penalty") or 0)),
                reverse=True)
     best = takes[0]
     v = best["verdict"]
     evidence.update(
         analysis=best["analysis"], verdict=v, verdict_reasons=best["reasons"],
         best_take=best["idx"] + 1, best_seed=best["seed"],
-        lm_metadata=(getattr(result, "extra_outputs", {}) or {}).get("lm_metadata"),
-        takes=[{"take": t["idx"] + 1, "verdict": t["verdict"], "align": t["align"], "seed": t["seed"], "continuity": t["analysis"].get("continuity")}
-               for t in takes],
+        lm_metadata=lm_meta,
+        monotony=(best["analysis"].get("monotony") or {}).get("score"),
+        takes=[{"take": t["take"], "verdict": t["verdict"], "align": t["align"], "seed": t["seed"],
+                "continuity": t["analysis"].get("continuity"),
+                "monotony": (t["analysis"].get("monotony") or {}).get("score")} for t in takes],
     )
-    log(f"최종 선택: take {best['idx'] + 1} (판정 {v}, 가사정렬 {best['align']})")
+    log(f"최종 선택: take {best['take']} (판정 {v}, 가사정렬 {best['align']}, "
+        f"단조로움 {evidence['monotony']})")
+    if not args.no_variety and (evidence["monotony"] or 0) >= 60:
+        log("[경고] 선택된 테이크가 단조로운 편입니다(같은 마디 반복 성향). "
+            "테이크 수를 늘리거나 --take-variety 를 키워 다시 생성해 보세요.")
 
     final = out_path
     if v != "OK" and not args.allow_suspect:

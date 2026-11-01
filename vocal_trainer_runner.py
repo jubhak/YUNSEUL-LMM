@@ -344,10 +344,11 @@ def analyze_music(path: Path, max_sec: float):
     return bpm, keyscale, total
 
 
-def build_caption(category: str, bpm, is_instrumental: bool):
-    from training_genres import GENRES, caption_for
+def build_caption(category: str, bpm, is_instrumental: bool, key: str = ""):
+    from training_genres import GENRES, caption_for, caption_variant
     if category in GENRES or category == "unknown":
-        base = caption_for(category)
+        # 곡마다 전개 서술을 다르게 준다 (같은 caption 반복 -> 단조로운 LoRA)
+        base = caption_variant(category, key) if key else caption_for(category)
         if is_instrumental:
             base = base.replace(", clear lead vocal", "").replace(", lead vocal", "").replace(", expressive lead vocal", "")
             base += ", instrumental"
@@ -671,7 +672,7 @@ def main():
             "source_name": af.name, "file": link_name, "category": category,
             "lyrics": lyrics, "lyrics_source": source, "is_instrumental": is_inst,
             "bpm": bpm, "keyscale": keyscale, "duration": round(total_sec, 1),
-            "caption": build_caption(category, bpm, is_inst),
+            "caption": build_caption(category, bpm, is_inst, key=Path(s.get("filename") or "").stem or str(i)),
         }
         cache_file.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
         log(f"  ✓ {af.name[:40]} | {source} {n_lines}줄 | BPM {bpm} | {keyscale}")

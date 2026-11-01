@@ -28,6 +28,7 @@ from lyrics_writer import (
     estimate_duration_sec, generate_lyrics, get_guide,
 )
 import voice_catalog
+import gemini_lyrics
 
 SINGER_STYLES = [("발라드 · 애절하게", "ballad"), ("파워 · 힘있게", "power"),
                  ("아이돌 · 밝고 또렷하게", "idol"), ("자연스럽게", "natural")]
@@ -139,10 +140,12 @@ class LyricsWorker(QThread):
     progress = pyqtSignal(str)
     finished = pyqtSignal(bool, str, str)
 
-    def __init__(self, port, model, feeling, genre_key, duration, extra, provider="gemini", api_key=None, gemini_model=None):
+    def __init__(self, port, model, feeling, genre_key, duration, extra, provider="gemini",
+                 api_key=None, gemini_model=None, thinking_level="high"):
         super().__init__()
         self.args = (port, model, feeling, genre_key, duration, extra)
-        self.provider_options = dict(provider=provider, api_key=api_key, gemini_model=gemini_model)
+        self.provider_options = dict(provider=provider, api_key=api_key, gemini_model=gemini_model,
+                                     thinking_level=thinking_level)
 
     def run(self):
         port, model, feeling, genre_key, duration, extra = self.args
@@ -528,9 +531,17 @@ class SongStudio(QWidget):
         self.edit_gemini_key.setEchoMode(QLineEdit.EchoMode.Password)
         self.edit_gemini_key.setPlaceholderText("Gemini API 키 (디스크 저장 안 함 / 환경변수 지원)")
         provider_row.addWidget(self.edit_gemini_key, 1)
-        self.edit_gemini_model = QLineEdit(os.environ.get("GEMINI_MODEL", "gemini-1.5-flash"))
-        self.edit_gemini_model.setToolTip("사용 가능한 Gemini 모델 ID. 가사 주제와 초안은 Google API로 전송됩니다.")
+        self.edit_gemini_model = QLineEdit(os.environ.get("GEMINI_MODEL", gemini_lyrics.DEFAULT_MODEL))
+        self.edit_gemini_model.setToolTip(
+            "사용할 Gemini 모델 ID. 종료된 모델(gemini-1.5-flash 등)을 적어도 현행 모델로 자동 변환됩니다.\n"
+            "가사 주제와 초안은 Google API로 전송됩니다.")
         provider_row.addWidget(self.edit_gemini_model)
+        self.combo_lyric_quality = QComboBox()
+        for label, level in (("정밀 (느림)", "high"), ("보통", "medium"), ("빠름", "low")):
+            self.combo_lyric_quality.addItem(label, level)
+        self.combo_lyric_quality.setToolTip(
+            "Gemini 사고 깊이(thinkingLevel). 높을수록 구조·운율을 더 따져 씁니다.")
+        provider_row.addWidget(self.combo_lyric_quality)
         lay.addLayout(provider_row)
 
         row = QHBoxLayout()
@@ -844,10 +855,12 @@ class SongStudio(QWidget):
         self.lyrics_worker = LyricsWorker(self.host.port, self.host.cfg.get("text_model", "qwen3:14b"), idea,
                                           self._genre(), self.combo_form.currentData(), extra,
                                           provider=provider, api_key=self.edit_gemini_key.text().strip(),
-                                          gemini_model=self.edit_gemini_model.text().strip())
+                                          gemini_model=self.edit_gemini_model.text().strip(),
+                                          thinking_level=self.combo_lyric_quality.currentData() or "high")
         self.lyrics_worker.progress.connect(lambda m: self.lbl_lyrics_status.setText(m.strip()))
         self.lyrics_worker.finished.connect(self._on_lyrics_done)
-        self.lbl_lyrics_status.setText("가사를 쓰는 중... (30초~1분)")
+        self.lbl_lyrics_status.setText(
+            f"가사를 쓰는 중... ({gemini_lyrics.describe(self.edit_gemini_model.text().strip()) if provider == 'gemini' else 'Ollama'})")
         self._lyrics_busy = True
         self.lyrics_worker.start()
         self._update_buttons()

@@ -172,7 +172,12 @@ ARRANGEMENT = {
 }
 
 CLICHE_WORDS = ["그리움", "눈물", "추억", "영원히", "영원한", "운명", "기적", "별빛", "아픔",
-                "슬픔", "행복", "사랑해", "가슴이", "심장이", "너만을", "아련", "시린"]
+                "슬픔", "행복", "사랑해", "가슴이", "심장이", "너만을", "아련", "시린",
+                "그대여", "나에게로", "운명처럼", "숨쉴 수 없어", "미치도록", "가슴이 아파"]
+
+# 줄 첫 단어가 겹치면 멜로디 시작이 똑같아진다 -> 채점에서 감점
+BANNED_OPENERS = ["그대", "너를", "나는", "우리", "이제", "다시", "아직", "여전", "혼자", "오늘",
+                  "너의", "나의", "그날", "이 밤", "저 별"]
 
 SECTION_ALIASES = {
     "intro": "Intro", "인트로": "Intro",
@@ -185,18 +190,26 @@ SECTION_ALIASES = {
     "outro": "Outro", "아웃트로": "Outro",
 }
 
-LYRICIST_SYSTEM = """당신은 한국 대중가요 히트곡을 여럿 쓴 작사가입니다. 소리 내어 불렀을 때 자연스러운 가사를 씁니다.
+LYRICIST_SYSTEM = """당신은 한국 대중가요 히트곡을 여럿 쓴 작사가입니다. 소리 내어 불렀을 때 자연스럽고, 한 곡 안에서 멜로디가 지루해지지 않는 가사를 씁니다.
+
+[가장 중요한 원칙 - 단조로움 금지]
+- 모든 줄을 같은 음절 수로 채우지 않는다. 한 섹션 안에서도 줄 길이를 일부러 섞어 멜로디 리듬이 변하게 한다.
+- 각 줄의 첫 단어를 서로 다르게 시작한다. 같은 단어로 시작하는 줄이 두 개면 실패다.
+- 같은 문장 구조(주어+목적어+서술어)를 연속으로 쓰지 않는다. 짧은 줄, 긴 줄, 감탄형, 질문형을 섞는다.
+- 같은 어미(-잖아, -는데, -니까, -서)를 세 줄 이상 반복하지 않는다.
+- Verse는 낮고 촘촘하게, Pre-Chorus는 상승, Chorus는 길고 열린 모음으로 부를 수 있게 쓴다. 구간마다 호흡이 달라야 한다.
+- Bridge는 지금까지 나온 이미지와 문장 리듬을 뒤집는다.
 
 [작사 원칙]
 - 한 곡에는 중심 이미지(은유) 하나만 쓰고, 그 이미지를 섹션마다 다른 각도로 변주한다. 이미지를 섞지 않는다.
 - 그리움, 슬픔, 운명, 영원 같은 추상어를 나열하지 말고 구체적인 장면, 사물, 행동으로 감정을 보여준다.
 - 형용사를 쌓지 않는다.
-- 한 줄은 한 숨에 자연스럽게 부를 길이로 쓰고, 같은 섹션 안의 줄은 음절 수를 비슷하게 맞춘다. 혀가 꼬이는 말, 막히는 받침 연속은 피한다.
-- 줄 끝 모음이나 받침을 맞춰 운율을 만든다.
-- Verse는 이야기를 진행하고, Pre-Chorus는 긴장을 쌓고, Chorus는 곡의 제목이 될 한 줄 훅을 첫 줄이나 마지막 줄에 둔다.
+- 혀가 꼬이는 말, 막히는 받침 연속은 피하고 부르기 편한 모음으로 줄을 맺는다.
+- Chorus에는 곡의 제목이 될 한 줄 훅을 첫 줄 또는 마지막 줄에 둔다. 훅은 짧고 기억하기 쉬워야 한다.
 - Verse 2는 Verse 1과 다른 시간, 다른 장면으로 이야기를 전진시키고 Verse 1의 줄을 재사용하지 않는다.
 - 마침표와 쉼표는 쓰지 않는다. 배경 코러스는 (괄호)로 짧게만 쓴다.
-- 구조 태그와 가사 줄만 출력한다. 제목, 해설, 번호, 이모지, 음절 수 표기를 쓰지 않는다."""
+- 기존 노래 가사를 인용하지 않는다.
+- 구조 태그와 가사 줄만 출력한다. 제목, 해설, 번역, 이모지, 음절 수 표기를 쓰지 않는다."""
 
 
 def get_guide(genre_key: str) -> dict:
@@ -370,36 +383,133 @@ def score_sections(sections: Dict[str, List[str]], form: str, guide: dict) -> Tu
         if eng:
             score -= 3 * len(eng)
             notes.append("영어 줄을 한국어로 바꿀 것: " + " / ".join(eng[:3]))
+    v_score, v_notes = variety_report(sections, form, guide)
+    if v_score < 95:
+        score -= (95 - v_score) // 2
+        notes.extend(v_notes)
     return score, notes
 
 
-def build_prompt(topic: str, guide: dict, form: str, extra: str = "") -> str:
+# 줄마다 다른 음절 수를 지정해 멜로디 리듬이 반복되지 않게 한다 (기준 = (lo+hi)//2)
+RHYTHM_PATTERNS = {
+    "Verse 1": (0, 1, -1, 1),
+    "Verse 2": (1, 0, 1, -1),
+    "Pre-Chorus": (0, 1, 2),
+    "Chorus": (2, 3, 1, 2),
+    "Bridge": (1, -1, 2),
+    "Final Line": (3,),
+    "Outro": (0, -1),
+}
+
+DRAFT_ANGLES = [
+    "장면 중심: 한 장소의 사물과 행동만으로 감정을 보여준다.",
+    "대화 중심: 상대에게 말을 거는 2인칭 문장으로 쓴다.",
+    "시간 중심: 지나간 한 장면과 지금을 번갈아 배치한다.",
+    "감각 중심: 소리, 온도, 빛 같은 감각 묘사로 장면을 연다.",
+]
+
+
+def syllable_targets(section: str, n_lines: int, lo: int, hi: int) -> List[int]:
+    """섹션/줄별 목표 음절 수. 세 줄 이상 같은 값이 연속되지 않게 만든다."""
+    base = (lo + hi) // 2
+    pattern = RHYTHM_PATTERNS.get(section, (0, 1, 0, 1))
+    out = [max(lo, min(hi, base + pattern[i % len(pattern)])) for i in range(max(1, n_lines))]
+    for i in range(2, len(out)):
+        if out[i] == out[i - 1] == out[i - 2]:
+            out[i] = max(lo, min(hi, out[i] + (1 if out[i] < hi else -1)))
+    return out
+
+
+def variety_report(sections: Dict[str, List[str]], form: str, guide: dict) -> Tuple[int, List[str]]:
+    """가사의 리듬/어휘 반복을 점수화한다. 낮을수록 단조롭다."""
+    from collections import Counter
+
+    score, notes = 100, []
+    for name, lines in sections.items():
+        lines = [l for l in lines if l.strip()]
+        if len(lines) < 3:
+            continue
+        firsts = [re.split(r"\s+", l.strip())[0] for l in lines]
+        dup = len(firsts) - len(set(firsts))
+        if dup:
+            score -= 6 * dup
+            notes.append(f"[{name}] 같은 단어로 시작하는 줄이 {dup}개 -> 첫 단어를 모두 다르게")
+        syl = [count_syllables(l) for l in lines]
+        if len(set(syl)) == 1:
+            score -= 9
+            notes.append(f"[{name}] 모든 줄이 {syl[0]}음절로 같음 -> 멜로디가 한 마디처럼 반복됩니다. 한두 줄 길이를 바꿀 것")
+        elif len(syl) >= 4 and len(set(syl)) == 2:
+            score -= 3
+            notes.append(f"[{name}] 음절 수가 두 값({sorted(set(syl))})만 반복됨 -> 더 섞을 것")
+        tails = [l.strip()[-2:] for l in lines]
+        top_tail, cnt = Counter(tails).most_common(1)[0]
+        if cnt >= 3:
+            score -= 5
+            notes.append(f"[{name}] '{top_tail}'로 끝나는 줄이 {cnt}개 -> 어미를 섞을 것")
+        ends = [re.sub(r"[^가-힣A-Za-z]", "", l)[-1:] for l in lines]
+        ends = [e for e in ends if e]
+        if ends:
+            top_end, cnt_end = Counter(ends).most_common(1)[0]
+            if cnt_end / len(ends) >= 0.75:
+                score -= 5
+                notes.append(f"[{name}] 줄 끝소리가 '{top_end}'로 {cnt_end}/{len(ends)} 겹침 -> 다른 모음으로 맺을 것")
+
+    verse1, chorus = sections.get("Verse 1", []), sections.get("Chorus", [])
+    if verse1 and chorus:
+        v_mean = sum(map(count_syllables, verse1)) / len(verse1)
+        c_mean = sum(map(count_syllables, chorus)) / len(chorus)
+        if c_mean - v_mean < 1.0:
+            score -= 6
+            notes.append("후렴이 1절보다 길게 열려 있지 않음 -> 후렴 줄을 더 길게 불러 상승감을 만들 것")
+
+    words = re.findall(r"[가-힣]{2,}", " ".join(l for v in sections.values() for l in v))
+    if len(words) >= 20:
+        ttr = len(set(words)) / len(words)
+        if ttr < 0.55:
+            score -= 8
+            notes.append(f"같은 단어 반복이 많음(고유어 비율 {ttr:.2f}) -> 다른 단어로 바꿀 것")
+    return max(0, score), notes
+
+
+def build_prompt(topic: str, guide: dict, form: str, extra: str = "", angle: str = "") -> str:
     lo, hi = guide["syllables"]
     spec_lines = []
     for name, n in UNIQUE_SECTIONS[form]:
+        targets = syllable_targets(name, n, lo, hi)
+        syl_txt = "·".join(str(t) for t in targets)
         if name == "Chorus":
-            spec_lines.append(f"[Chorus]  ({n}줄, 곡의 훅. 이 후렴이 곡 전체에서 그대로 반복된다)")
+            spec_lines.append(f"[Chorus]  ({n}줄 / 음절 {syl_txt} / 곡의 훅. 이 후렴이 곡 전체에서 그대로 반복된다)")
         elif name == "Final Line":
-            spec_lines.append("[Final Line]  (1줄. 마지막 후렴의 마지막 줄을 대신해 감정을 최고조로 끌어올리는 한 줄)")
+            spec_lines.append("[Final Line]  (1줄 / 음절 " + syl_txt + " / 마지막 후렴의 마지막 줄을 대신해 감정을 최고조로 끌어올리는 한 줄)")
         elif name == "Bridge":
-            spec_lines.append(f"[Bridge]  ({n}줄. 시점이나 감정이 뒤집히는 전환)")
+            spec_lines.append(f"[Bridge]  ({n}줄 / 음절 {syl_txt} / 시점과 문장 리듬이 뒤집히는 전환)")
+        elif name.startswith("Verse"):
+            spec_lines.append(f"[{name}]  ({n}줄 / 음절 {syl_txt} / 낮고 촘촘한 이야기)")
         else:
-            spec_lines.append(f"[{name}]  ({n}줄)")
+            spec_lines.append(f"[{name}]  ({n}줄 / 음절 {syl_txt})")
     spec = "\n".join(spec_lines)
+    banned = ", ".join(CLICHE_WORDS)
     return f"""[주제] {topic}
 [장르] {guide['name']} (약 {guide['bpm']} BPM)
 [분위기와 화자] {guide['tone']}
 [영어 사용] {guide['english']}
-[줄당 음절] 한 줄 {lo}~{hi}음절
+[줄당 음절] 한 줄 {lo}~{hi}음절 (아래 지정값 우선)
+{('[접근 방식] ' + angle) if angle else ''}
 {('[추가 요청] ' + extra) if extra else ''}
 
 아래 섹션을 이 순서대로 한 번씩만 쓰세요. 태그 줄은 대괄호 그대로 쓰고, 괄호 안 설명은 출력하지 마세요.
 {spec}
 
-문장이 자연스러운 구어체인지 확인하고 조사 누락·번역투·뜬금없는 이미지 나열을 피하세요.
-주제의 구체적 장면 하나를 중심으로 시간·화자·감정을 일관되게 유지하세요.
-음절 수를 맞추려고 단어를 자르거나 의미 없는 어미를 붙이지 마세요. 자연스러운 의미가 우선입니다.
-기존 노래 가사를 인용하지 말고 독창적으로 쓰세요. 설명·평가·코드펜스는 출력하지 마세요.
+[단조로움 금지 - 반드시 지킬 것]
+1. 위에 적힌 음절 수를 그대로 지키세요. 같은 음절 수가 세 줄 연속되면 멜로디가 같은 마디처럼 반복됩니다.
+2. 각 줄의 첫 단어를 모두 다르게 시작하세요. 같은 단어로 시작하는 줄이 두 개면 실패입니다.
+3. Verse는 짧게, Chorus는 길게. 이 길이 차이가 곡의 상승감을 만듭니다.
+4. 같은 어미로 끝나는 줄을 세 줄 이상 만들지 마세요.
+5. 다음 상투어는 쓰지 마세요: {banned}
+6. 문장이 자연스러운 구어체인지 확인하고 조사 누락·번역투·뜬금없는 이미지 나열을 피하세요.
+7. 주제의 구체적 장면 하나를 중심으로 시간·화자·감정을 일관되게 유지하세요.
+8. 음절 수를 맞추려고 단어를 자르거나 의미 없는 어미를 붙이지 마세요. 자연스러운 의미가 우선입니다.
+9. 기존 노래 가사를 인용하지 말고 독창적으로 쓰세요. 설명·평가·코드펜스는 출력하지 마세요.
 
 출력 예시 형식:
 [Verse 1]
@@ -424,26 +534,37 @@ def _revise_prompt(raw_sections: Dict[str, List[str]], notes: List[str], form: s
 def generate_lyrics(topic: str, genre_key: str = "ballad_acoustic", duration: Optional[float] = None,
                     model: str = "qwen3:14b", port: int = 11434, candidates: int = 2,
                     extra: str = "", log=print, provider: str = "gemini",
-                    api_key: str = None, gemini_model: str = None) -> str:
+                    api_key: str = None, gemini_model: str = None,
+                    thinking_level: str = "high") -> str:
     if provider not in ("gemini", "ollama"):
         raise ValueError("지원하지 않는 가사 공급자입니다.")
+
     def generate(prompt, **kwargs):
         if provider == "gemini":
+            # Gemini 3 세대는 temperature 를 낮추면 루프/품질 저하가 공식 보고되어
+            # temperature 는 건드리지 않고(클라이언트가 1.0 유지), 창의성은
+            # thinkingLevel 과 후보 수(candidates)로 확보한다.
             return gemini_generate(prompt, api_key=api_key, model=gemini_model,
                                    system=kwargs.get("system", LYRICIST_SYSTEM),
-                                   temperature=kwargs.get("temperature", 0.8))
+                                   temperature=None,
+                                   thinking_level=thinking_level,
+                                   max_output_tokens=16384,
+                                   seed=kwargs.get("seed"))
         return ollama_generate(prompt, **kwargs)
+
     guide = get_guide(genre_key)
     form = song_form(duration)
-    prompt = build_prompt(topic, guide, form, extra)
     # 후렴 반복을 코드가 처리하므로 반복 억제 페널티는 낮게 둔다
     opts = {"repeat_penalty": 1.05, "presence_penalty": 0.2, "frequency_penalty": 0.2}
 
     best = None
-    for i in range(max(1, candidates)):
-        log(f"✍️ 가사 초안 {i + 1}/{candidates} 작성 중...")
+    total = max(1, candidates)
+    for i in range(total):
+        angle = DRAFT_ANGLES[i % len(DRAFT_ANGLES)]
+        prompt = build_prompt(topic, guide, form, extra, angle=angle)
+        log(f"✍️ 가사 초안 {i + 1}/{total} 작성 중... ({angle.split(':')[0]})")
         raw = generate(prompt, model=model, port=port, system=LYRICIST_SYSTEM,
-                              max_tokens=1500, temperature=0.9, options=opts)
+                       max_tokens=1500, temperature=0.9, options=opts, seed=1013 + i * 7717)
         secs = parse_sections(raw)
         sc, notes = score_sections(secs, form, guide)
         log(f"   초안 {i + 1} 점수 {sc}")
@@ -451,20 +572,26 @@ def generate_lyrics(topic: str, genre_key: str = "ballad_acoustic", duration: Op
             best = (sc, secs, notes)
 
     sc, secs, notes = best
-    if (notes and sc < 90) or provider == "gemini":
+    if (notes and sc < 92) or provider == "gemini":
         log("🔧 지적 사항 퇴고 중...")
-        raw = generate(_revise_prompt(secs, notes + ["어색한 조사/번역투를 자연스럽게 고치고 주제와 화자, 장면의 인과관계를 점검"], form, guide), model=model, port=port,
-                              system=LYRICIST_SYSTEM, max_tokens=1500, temperature=0.6, options=opts)
+        raw = generate(_revise_prompt(secs, notes + ["어색한 조사/번역투를 자연스럽게 고치고 주제와 화자, 장면의 인과관계를 점검",
+                                                     "같은 음절 수·같은 첫 단어·같은 어미가 반복되면 반드시 하나를 바꿀 것"],
+                                      form, guide),
+                       model=model, port=port, system=LYRICIST_SYSTEM,
+                       max_tokens=1500, temperature=0.6, options=opts, seed=4241)
         new_secs = parse_sections(raw)
-        new_sc, _ = score_sections(new_secs, form, guide)
+        new_sc, new_notes = score_sections(new_secs, form, guide)
         log(f"   퇴고본 점수 {new_sc} (기존 {sc})")
         if new_sc >= sc:
-            secs, sc = new_secs, new_sc
+            secs, sc, notes = new_secs, new_sc, new_notes
 
     if not secs.get("Chorus") and not secs.get("Verse 1"):
         raise RuntimeError("가사 생성 결과에서 Verse/Chorus 구조를 찾지 못했습니다. 다시 시도해 주세요.")
     lyrics = assemble(secs, form, guide)
-    log(f"✅ 가사 완성 (점수 {sc}, 예상 길이 약 {estimate_duration_sec(lyrics, guide['bpm'])}초)")
+    v_score, _ = variety_report(secs, form, guide)
+    log(f"✅ 가사 완성 (점수 {sc}, 다양성 {v_score}/100, 예상 길이 약 {estimate_duration_sec(lyrics, guide['bpm'])}초)")
+    if v_score < 70:
+        log("   ⚠️ 반복이 많은 초안입니다. 마음에 안 드는 줄은 직접 고치거나 한 번 더 생성해 보세요.")
     return lyrics
 
 

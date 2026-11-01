@@ -42,3 +42,20 @@ def detect_genre(path):
 
 def caption_for(category):
     return GENRES.get(category, ("", ""))[1] or "music, original arrangement, clear lead vocal"
+
+
+# 모든 학습 곡에 같은 caption 을 붙이면 LoRA 가 '평균적인 곡'만 배워 결과가 단조로워진다.
+# 곡마다 다른 전개/편곡 서술을 결정적으로 섞어 구간 대비를 학습시킨다.
+STRUCTURE_VARIANTS = (
+    ", dynamic verse-chorus contrast, clear section changes",
+    ", builds from verse to chorus, bridge with new chord progression",
+    ", varied drum pattern per section, arrangement break before final chorus",
+    ", sparse intro, full band in chorus, tagged outro",
+)
+
+
+def caption_variant(category, key=""):
+    """같은 장르라도 곡마다 다른 편곡 서술을 붙인 caption (key 로 결정적 선택)."""
+    base = caption_for(category)
+    weight = sum(ord(c) for c in str(key)) if key else 0
+    return base + STRUCTURE_VARIANTS[weight % len(STRUCTURE_VARIANTS)]
