@@ -921,14 +921,18 @@ class YunseulLMMStudio(QWidget):
         self.edit_topic.setStyleSheet("background-color: #1e293b; color: white; border: 1px solid #334155; border-radius: 6px; padding: 6px 10px;")
         top_bar.addWidget(self.edit_topic)
 
-        top_bar.addWidget(QLabel("분량:"))
+        top_bar.addWidget(QLabel("분량 프리셋:"))
         self.combo_length = QComboBox()
         self.combo_length.addItems([
-            "📚 정규 단행본 완필 (약 25,000 ~ 30,000자 / 7개 챕터)",
-            "심층 단편 리포트 (약 5,000자 / 1개 챕터)",
-            "핵심 요약 개요 (약 1,500자)"
+            "📚 정규 단행본 프리셋 (약 25,000 ~ 30,000자 / 7개 챕터)",
+            "📄 심층 리포트 프리셋 (약 5,000자 / 1개 챕터)",
+            "🗂️ 핵심 요약 프리셋 (약 1,500자)"
         ])
         self.combo_length.setStyleSheet("background-color: #1e293b; color: white; border: 1px solid #334155; border-radius: 6px; padding: 5px;")
+        self.combo_length.setToolTip(
+            "쪽수를 지정하지 않았을 때 쓰는 기본 프리셋입니다.\n"
+            "아래 '목표 쪽수'에 40쪽 이상을 넣으면 이 프리셋 대신\n"
+            "쪽수 기준 장편 파이프라인이 자동으로 우선합니다.")
         top_bar.addWidget(self.combo_length)
 
         # ---- 2행: 장르 페르소나 · 분량(쪽) · 외부 페르소나 ----------------
@@ -954,7 +958,8 @@ class YunseulLMMStudio(QWidget):
         self.spin_ebook_pages.setSpecialValueText("기본 분량")
         self.spin_ebook_pages.setStyleSheet("background-color: #1e293b; color: white; border: 1px solid #334155; border-radius: 6px; padding: 4px;")
         self.spin_ebook_pages.setToolTip(
-            "40쪽 이상이면 장편 모드: 상세 아웃라인 → 장별 집필 → 수정 패스 → 일관성 점검.\n"
+            "40쪽 이상이면 이 값이 분량 프리셋보다 우선합니다(장편 모드).\n"
+            "상세 아웃라인 → 절별 브리프 → 장별 집필 → 수정 패스 → 일관성 점검.\n"
             "쪽당 약 450자 환산 (300쪽 ≈ 13만 5천 자)")
         row2.addWidget(self.spin_ebook_pages)
 
@@ -970,6 +975,10 @@ class YunseulLMMStudio(QWidget):
         self.lbl_ebook_persona.setStyleSheet("color: #7dd3fc; font-size: 11px;")
         self.lbl_ebook_persona.setWordWrap(True)
         layout.addWidget(self.lbl_ebook_persona)
+        self.lbl_length_status = QLabel("")
+        self.lbl_length_status.setStyleSheet("color: #86efac; font-size: 11px;")
+        self.lbl_length_status.setWordWrap(True)
+        layout.addWidget(self.lbl_length_status)
 
         self.btn_write_ebook = QPushButton("✨ 전자책 집필 시작")
         self.btn_write_ebook.setStyleSheet("background-color: #0284c7; color: white; font-weight: bold; border-radius: 6px; padding: 7px 16px;")
@@ -1089,8 +1098,10 @@ class YunseulLMMStudio(QWidget):
             field.textChanged.connect(self._queue_ebook_autosave)
         self.txt_ebook.textChanged.connect(self._queue_ebook_autosave)
         self.combo_length.currentIndexChanged.connect(self._queue_ebook_autosave)
+        self.combo_length.currentIndexChanged.connect(self._update_length_hint)
         self.combo_ebook_genre.currentIndexChanged.connect(self._queue_ebook_autosave)
         self.spin_ebook_pages.valueChanged.connect(self._queue_ebook_autosave)
+        self.spin_ebook_pages.valueChanged.connect(self._update_length_hint)
         self._ebook_restoring = False
         return w
 
@@ -1738,6 +1749,28 @@ class YunseulLMMStudio(QWidget):
             f"가치관: {d['values']} / 문체: {d['voice']} / 금기: {d['taboo']} / "
             f"장 비트: {' → '.join(d['beats'])}")
 
+    def _update_length_hint(self):
+        """분량 결정 경로를 실시간으로 보여준다(프리셋 vs 목표 쪽수 - 단일 기준: resolve_length)."""
+        try:
+            pages = int(self.spin_ebook_pages.value() or 0)
+            genre = self.combo_ebook_genre.currentData() or ""
+            mode = ("full", "chapter", "summary")[max(0, self.combo_length.currentIndex())]
+            r = ebook_persona.resolve_length(pages, genre, mode)
+        except Exception:
+            return
+        if r["path"] == "long":
+            self.combo_length.setEnabled(False)
+            self.lbl_length_status.setText(
+                f"📏 분량 결정: '목표 쪽수' 우선 — {r['pages']}쪽 ≈ {r['target_chars']:,}자 / "
+                f"약 {r['n_chapters']}개 챕터 × {r['sections_per_chapter']}개 소제목 × 절당 약 {r['chars_per_section']:,}자 "
+                f"(장편 파이프라인, 절별 브리프 + 깊이 확장 적용)")
+        else:
+            self.combo_length.setEnabled(True)
+            self.lbl_length_status.setText(
+                f"📏 분량 결정: '분량 프리셋' 사용 — 약 {r['target_chars']:,}자 / "
+                f"{r['n_chapters']}챕터 × {r['sections_per_chapter']}소제목 × 절당 약 {r['chars_per_section']:,}자 "
+                f"(목표 쪽수 40쪽 이상부터 쪽수 기준으로 전환)")
+
     def start_ebook_generation(self):
         if not self.is_server_alive():
             QMessageBox.warning(self, "서버 미실행", "Ollama 서버가 정지되어 있습니다. 먼저 [서버 시작] 버튼을 눌러주세요.")
@@ -1782,6 +1815,7 @@ class YunseulLMMStudio(QWidget):
         genre = self.combo_ebook_genre.currentData() or ""
         extra_persona = self.edit_ebook_persona.text().strip()
         total_pages = int(self.spin_ebook_pages.value() or 0)
+        self._update_length_hint()
         if total_pages >= 40:
             mode = "long"
         model = self.cfg.get("text_model", "qwen3:14b")

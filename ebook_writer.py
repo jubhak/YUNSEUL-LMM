@@ -346,6 +346,7 @@ def save_ebook_auto_increment(title: str, markdown_content: str, books_dir: Path
 # =============================================================================
 import ebook_persona  # noqa: E402  (장르 페르소나 + 장편 구조. 근거: Nature 2023 role-play,
                       #  IEEE Access 2026 programmable personas, Re3 EMNLP 2022, DOC ACL 2023)
+                      #  ※ 분량 결정 단일 기준: ebook_persona.resolve_length()
 
 from text_engine import (  # noqa: E402
     GenerationCancelled, RepetitionGuard, is_list_block, ollama_generate, paragraph_issues,
@@ -355,15 +356,11 @@ from text_engine import (  # noqa: E402
 META_PHRASES = ("이 절에서는", "이 장에서는", "살펴보겠습니다", "알아보겠습니다", "요약하자면")
 
 # mode -> (챕터 수, 챕터당 소제목 수, 소제목당 목표 글자 수)
-MODE_SPEC = {
-    "full": (7, 3, 1300),
-    "chapter": (1, 4, 1300),
-    "summary": (1, 3, 550),
-}
+# ※ 분량의 단일 기준은 ebook_persona.PRESET_MODES / ebook_persona.resolve_length 이다.
+#   ('목표 쪽수' 40쪽 이상 지정 시 프리셋 무시하고 쪽수 기준 장편 파이프라인이 우선)
+MODE_SPEC = ebook_persona.PRESET_MODES
 
 WRITER_SYSTEM = """당신은 한국어 논픽션 전문 저술가입니다. 편집자가 교정 없이 바로 넘길 수 있는 원고를 씁니다.
-
-[문체 원칙]
 - 한 문단에는 하나의 생각만 담고, 문단은 3~5문장으로 쓴다.
 - 같은 문장 끝맺음(~입니다, ~것입니다, ~보여줍니다, ~있습니다)을 세 문장 연속 쓰지 않는다. 짧은 문장, 질문, 인용, 장면 묘사를 섞어 리듬을 만든다.
 - '이는', '또한', '특히', '따라서', '이처럼', '결론적으로' 같은 문장 시작어를 한 문단에서 두 번 쓰지 않는다.
@@ -521,7 +518,62 @@ class EbookWriter:
                  "sections": [{"title": a, "point": b} for a, b in base_secs[:n_sec]]} for t in titles]
 
     # ------------------------------------------------------------------ 집필
-    def _section_prompt(self, plan, ch, sec, sec_idx, next_title, tail, target_chars):
+    def _section_brief(self, plan, ch, sec) -> str:
+        """집필 전 소제목별 브리프를 만든다 (pre-writing 분리, arXiv 2024).
+        3회 재시도하고 실패 시 골격 브리프로 폴백 - 절 성격이 흐려지는 것을 막는다."""
+        if self.genre:
+            g = ebook_persona.GENRES.get(self.genre, {})
+            beats = ", ".join((sec.get("beats") or g.get("beats") or [])[:5])
+        else:
+            beats = ""
+        prompt = f"""아래 절을 실제로 쓰기 전, 집필 브리프를 만드세요. 본문은 아직 쓰지 않는다.
+
+[책 주제] {self.topic}
+[현재 위치] {ch['title']} > {sec['title']}
+[이 절의 고유 논점] {sec.get('point', '')}
+[이 절에서 쓸 사례] {ch.get('examples', []) or '(기획 시 배정된 사례 없음 - 실존 사례 하나 제안)'}
+
+아래 JSON 형식으로만 응답하세요.
+{{"key_claims": ["이 절이 방어할 핵심 주장 2~3개"],
+ "evidence": ["인용할 실존 데이터/연구/사건과 출처(모르면 쓰지 말 것)"],
+ "counterpoint": "이 절에서 반드시 다룰 반론이나 한계 1개",
+ "scene": "독자의 눈에 그려질 구체적 장면/사례 1개",
+ "beats": ["전개 순서 3~5단계"]}}"""
+        for _ in range(3):
+            raw = self._gen(prompt, system=None, max_tokens=800, temperature=0.4,
+                            options={"presence_penalty": 0.0, "frequency_penalty": 0.0})
+            brief = _parse_json_block(raw)
+            if brief and (brief.get("key_claims") or brief.get("beats")):
+                break
+            brief = None
+        if not brief:
+            brief = {
+                "key_claims": [sec.get("point", "이 절의 고유 논점을 하나의 주장으로 정리")],
+                "evidence": [],
+                "counterpoint": "이 논점에 대한 가장 유력한 반론과 그에 대한 재반론",
+                "scene": "독자가 바로 그릴 수 있는 구체적 장면 하나",
+                "beats": [b.strip() for b in beats.split(",") if b.strip()] or ["도입", "논증", "사례", "반론", "정리"],
+            }
+        lines = ["[집필 브리프 - 아래 내용을 모두 다룰 것. 하나라도 빠지면 미완성으로 간주]"]
+        claims = brief.get("key_claims") or []
+        if claims:
+            lines.append("- 핵심 주장: " + " / ".join(str(c) for c in claims))
+        ev = brief.get("evidence") or []
+        if ev:
+            lines.append("- 근거(출처 있는 것만): " + " / ".join(str(e) for e in ev))
+        if brief.get("counterpoint"):
+            lines.append(f"- 반드시 다룰 반론: {brief['counterpoint']}")
+        if brief.get("scene"):
+            lines.append(f"- 장면: {brief['scene']}")
+        bts = brief.get("beats") or []
+        if bts:
+            lines.append("- 전개 순서: " + " → ".join(str(b) for b in bts))
+        elif beats:
+            lines.append(f"- 장르 비트: {beats}")
+        return "\n".join(lines)
+
+    def _section_prompt(self, plan, ch, sec, sec_idx, next_title, tail, target_chars,
+                        brief: str = ""):
         ledger = "\n".join(self.ledger[-45:]) or "(아직 없음)"
         avoid = self.guard.overused_phrases()
         avoid_txt = ", ".join(f"'{a}'" for a in avoid) if avoid else "(없음)"
@@ -537,6 +589,14 @@ class EbookWriter:
         nxt = f"\n[다음 소제목 - 이 내용은 미리 쓰지 말 것] {next_title}" if next_title else ""
         tail_txt = (f"\n[직전 원고의 마지막 부분 - 흐름만 이어받고, 그 내용을 요약하거나 다시 인용하지 말 것]\n{tail}\n"
                     if tail else "")
+        nxt2 = f"\n[다음 소제목 - 이 내용은 미리 쓰지 말 것] {next_title}" if next_title else ""
+        brief_txt = (f"\n{brief}\n" if brief else "")
+        depth_rules = (
+            f"[분량 조건] 최소 {target_chars}자(공백 포함). {int(target_chars * 0.85)}자가 넘지 않으면 미완성이므로,\n"
+            " 위 브리프의 각 요소를 표층에서 나열하지 말고 하나씩 파고들어 채운다:\n"
+            " 주장 -> 근거 -> 구체적 사례(사람/장소/연도) -> 반론과 재반론 -> 독자의 적용.\n"
+            " 개념 나열, 정의 나열, 요약 문단으로 분량을 채우지 않는다."
+        )
         return f"""[책 주제] {self.topic}
 [책 제목] {plan['book_title']}
 [핵심 메시지] {plan.get('core_message', '')}
@@ -546,6 +606,7 @@ class EbookWriter:
 [이 장의 요약] {ch.get('summary', '')}
 [이 절에서 다룰 고유 논점] {sec.get('point', '')}
 [이 절에서 쓸 사례] {examples}
+{brief_txt}
 
 [이미 다룬 내용 - 다시 설명하거나 같은 사례, 수치를 재사용하지 말 것]
 {ledger}
@@ -553,9 +614,10 @@ class EbookWriter:
 [이미 인용한 수치/출처/고유명 - 이번 절에서 다시 꺼내지 말 것] {facts_txt}
 
 [이미 여러 번 쓴 표현 - 이번 절에서는 쓰지 말 것] {avoid_txt}
-{tail_txt}{nxt}
+{tail_txt}{nxt2}
 
-위 조건으로 '{sec['title']}' 절의 본문을 약 {target_chars}자(공백 포함) 분량으로 쓰세요. 본문 문단만 출력하세요."""
+{depth_rules}
+위 조건으로 '{sec['title']}' 절의 본문을 쓰세요. 본문 문단만 출력하세요."""
 
     def _rewrite_paragraph(self, para, issues):
         avoid = self.guard.overused_phrases(top=8)
@@ -720,7 +782,14 @@ class EbookWriter:
     def write_section(self, plan, ch, sec_idx, tail, target_chars) -> str:
         sec = ch["sections"][sec_idx]
         next_title = ch["sections"][sec_idx + 1]["title"] if sec_idx + 1 < len(ch["sections"]) else ""
-        prompt = self._section_prompt(plan, ch, sec, sec_idx, next_title, tail, target_chars)
+        try:
+            brief = self._section_brief(plan, ch, sec)
+        except GenerationCancelled:
+            raise
+        except Exception:
+            brief = ""
+        prompt = self._section_prompt(plan, ch, sec, sec_idx, next_title, tail, target_chars,
+                                      brief=brief)
         body = self._gen(prompt, max_tokens=int(target_chars * 1.8) + 500)
         body = _clean_section_body(body, [ch["title"], sec["title"]])
         body, removed = self.guard.filter_new_text(body)
@@ -742,10 +811,14 @@ class EbookWriter:
         return body
 
     def write(self) -> str:
-        _, _, target_chars = MODE_SPEC[self.mode]
-        long_mode = bool(self.genre and self.total_pages >= 40)
+        # 분량 결정은 resolve_length 단일 기준으로만 한다(쪽수 40+ = 장편, 미만 = 프리셋)
+        spec = ebook_persona.resolve_length(self.total_pages, self.genre, self.mode)
+        target_chars = spec["chars_per_section"]
+        long_mode = spec["path"] == "long"
         self._bodies = []
         self.on_progress("기획: 챕터와 소제목, 장별 사례 배정 중...", 0, 1, 0)
+        self.log(f"📏 분량 결정: {spec['path']} 경로 / 목표 {spec['target_chars']:,}자 "
+                 f"({spec['n_chapters']}챕터 × {spec['sections_per_chapter']}소제목 × 약{spec['chars_per_section']:,}자)")
         plan = self.plan()
         chapters = plan["chapters"]
         total_steps = sum(len(c["sections"]) for c in chapters)

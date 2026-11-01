@@ -238,6 +238,48 @@ def plan_chapters(total_pages: int, genre_key: str, chapter_target: int | None =
     }
 
 
+# ---------------------------------------------------------------- 분량 결정 (단일 기준)
+# mode 프리셋: (챕터 수, 챕터당 소제목 수, 소제목당 목표 글자 수)
+# '목표 쪽수'를 지정하면(40쪽 이상) 이 프리셋보다 쪽수가 항상 우선한다.
+PRESET_MODES = {
+    "full": (7, 3, 1300),
+    "chapter": (1, 4, 1300),
+    "summary": (1, 3, 550),
+}
+CHARS_PER_PAGE = 450   # 국문 단행본 1쪽 환산 기준
+LONG_MIN_PAGES = 40    # 이 값 이상부터 장편(path='long') 파이프라인 사용
+
+
+def resolve_length(total_pages: int = 0, genre_key: str = "", mode: str = "full") -> dict:
+    """분량 결정의 단일 출입구(single source of truth).
+
+    기존에는 ① UI 분량 콤보(mode 프리셋)와 ② 목표 쪽수 스피닝(total_pages)
+    두 경로가 각자 따로 굴었다. 이 함수 하나로 합쳤다:
+      - total_pages >= 40  → 쪽수가 프리셋보다 우선 (path='long')
+      - 그 외              → mode 프리셋 사용            (path='preset')
+    반환: {pages, path, mode, n_chapters, sections_per_chapter,
+           chars_per_section, target_chars}
+    """
+    total_pages = max(0, int(total_pages or 0))
+    if total_pages >= LONG_MIN_PAGES:
+        plan = plan_chapters(total_pages, genre_key or "economy")
+        n_sec = max(len(c["sections"]) for c in plan["chapters"])
+        return {
+            "pages": total_pages, "path": "long", "mode": "long",
+            "n_chapters": len(plan["chapters"]),
+            "sections_per_chapter": n_sec,
+            "chars_per_section": plan["chapters"][0]["sections"][0]["target_chars"],
+            "target_chars": total_pages * CHARS_PER_PAGE,
+        }
+    n_ch, n_sec, sec_chars = PRESET_MODES.get(mode, PRESET_MODES["full"])
+    return {
+        "pages": 0, "path": "preset", "mode": mode,
+        "n_chapters": n_ch, "sections_per_chapter": n_sec,
+        "chars_per_section": sec_chars,
+        "target_chars": n_ch * n_sec * sec_chars,
+    }
+
+
 def outline_prompt(topic: str, genre_key: str, total_pages: int, persona_extra: str = "") -> str:
     """상세 아웃라인(DOC 스타일) 생성 프롬프트."""
     g = GENRES.get(genre_key, GENRES["economy"])

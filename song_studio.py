@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 song_studio.py - 노래 만들기 스튜디오 화면
 
@@ -528,7 +528,7 @@ class SongStudio(QWidget):
         self.edit_gemini_key.setEchoMode(QLineEdit.EchoMode.Password)
         self.edit_gemini_key.setPlaceholderText("Gemini API 키 (디스크 저장 안 함 / 환경변수 지원)")
         provider_row.addWidget(self.edit_gemini_key, 1)
-        self.edit_gemini_model = QLineEdit(os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"))
+        self.edit_gemini_model = QLineEdit(os.environ.get("GEMINI_MODEL", "gemini-1.5-flash"))
         self.edit_gemini_model.setToolTip("사용 가능한 Gemini 모델 ID. 가사 주제와 초안은 Google API로 전송됩니다.")
         provider_row.addWidget(self.edit_gemini_model)
         lay.addLayout(provider_row)
@@ -1241,3 +1241,4 @@ class SongStudio(QWidget):
         self.current_song = None
         self.lbl_now.setText("노래를 선택하세요")
         self.refresh_library()
+

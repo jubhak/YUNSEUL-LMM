@@ -6,7 +6,13 @@ import urllib.error
 import urllib.request
 import re
 
-DEFAULT_MODEL = "gemini-2.5-flash"
+DEFAULT_MODEL = "gemini-1.5-flash"
+
+# 잘못 입력되기 쉬운 모델명 자동 매핑 (예: 존재하지 않는 gemini-2.5-flash -> gemini-1.5-flash)
+MODEL_ALIASES = {
+    "gemini-2.5-flash": "gemini-1.5-flash",
+    "gemini-2.5-pro": "gemini-1.5-pro",
+}
 
 
 def generate(prompt, system, api_key=None, model=None, temperature=0.8, **_):
@@ -14,7 +20,8 @@ def generate(prompt, system, api_key=None, model=None, temperature=0.8, **_):
            os.environ.get("GOOGLE_API_KEY") or "").strip()
     if not key:
         raise RuntimeError("Gemini API 키를 입력하거나 GEMINI_API_KEY 환경변수를 설정하세요.")
-    model = (model or os.environ.get("GEMINI_MODEL") or DEFAULT_MODEL).removeprefix("models/")
+    model = (model or os.environ.get("GEMINI_MODEL") or DEFAULT_MODEL).removeprefix("models/").strip()
+    model = MODEL_ALIASES.get(model, model)
     if not re.fullmatch(r"[A-Za-z0-9._-]+", model):
         raise ValueError("Gemini 모델 이름 형식이 올바르지 않습니다.")
     body = json.dumps({
@@ -34,10 +41,21 @@ def generate(prompt, system, api_key=None, model=None, temperature=0.8, **_):
             if exc.code in (429, 500, 502, 503, 504) and attempt < 2:
                 time.sleep(2 ** attempt)
                 continue
+            err_msg = ""
+            try:
+                raw_bytes = exc.read() if hasattr(exc, "read") else b""
+                if raw_bytes:
+                    err_json = json.loads(raw_bytes.decode("utf-8", errors="ignore"))
+                    err_msg = err_json.get("error", {}).get("message", "")
+            except Exception:
+                pass
+            if key and err_msg:
+                err_msg = err_msg.replace(key, "******")
             messages = {400: "요청 또는 모델 설정 확인", 401: "API 키 인증 실패",
                         403: "API 키 권한 확인", 404: "사용 가능한 모델 이름 확인",
                         429: "요청 한도 초과. 잠시 후 다시 시도"}
-            raise RuntimeError(f"Gemini HTTP {exc.code}: {messages.get(exc.code, '서비스 오류')}") from None
+            detail = f" ({err_msg})" if err_msg else f": {messages.get(exc.code, '서비스 오류')}"
+            raise RuntimeError(f"Gemini HTTP {exc.code}{detail}") from None
         except (urllib.error.URLError, TimeoutError):
             raise RuntimeError("Gemini 연결 실패: 네트워크 연결을 확인하세요.") from None
     candidates = result.get("candidates") or []
